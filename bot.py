@@ -539,7 +539,7 @@ async def lockdown_enable(interaction: discord.Interaction):
         await everyone_role.edit(permissions=permissions, reason="Server lockdown activated")
         
         # Update database
-        await db.update_server_field(guild.id, 'lockdown_enabled', 1)
+        await db.update_server_field(guild.id, 'lockdown_enabled', True)
         if guild.id not in server_configs:
             server_configs[guild.id] = {}
         server_configs[guild.id]['lockdown_enabled'] = True
@@ -583,7 +583,7 @@ async def lockdown_disable(interaction: discord.Interaction):
         await everyone_role.edit(permissions=permissions, reason="Server lockdown lifted")
         
         # Update database
-        await db.update_server_field(guild.id, 'lockdown_enabled', 0)
+        await db.update_server_field(guild.id, 'lockdown_enabled', False)
         if guild.id in server_configs:
             server_configs[guild.id]['lockdown_enabled'] = False
         
@@ -632,7 +632,7 @@ async def setup_verification(interaction: discord.Interaction, channel: discord.
         unverified_role_id=unverified_role.id,
         verified_role_id=verified_role.id,
         verification_channel_id=channel.id,
-        verification_enabled=1
+        verification_enabled=True
     )
     
     # Update in-memory cache
@@ -675,7 +675,7 @@ async def verification_enable(interaction: discord.Interaction):
         )
         return
     
-    await db.update_server_field(interaction.guild.id, 'verification_enabled', 1)
+    await db.update_server_field(interaction.guild.id, 'verification_enabled', True)
     server_configs[interaction.guild.id]['verification_enabled'] = True
     
     await interaction.response.send_message(
@@ -686,7 +686,7 @@ async def verification_enable(interaction: discord.Interaction):
 @bot.tree.command(name="verification_disable", description="Disable verification for new members")
 @app_commands.checks.has_permissions(administrator=True)
 async def verification_disable(interaction: discord.Interaction):
-    await db.update_server_field(interaction.guild.id, 'verification_enabled', 0)
+    await db.update_server_field(interaction.guild.id, 'verification_enabled', False)
     if interaction.guild.id in server_configs:
         server_configs[interaction.guild.id]['verification_enabled'] = False
     
@@ -850,7 +850,7 @@ async def setup_roblox_verification(interaction: discord.Interaction, channel: d
             unverified_role_id=unverified_role.id,
             verified_role_id=verified_role.id,
             verification_channel_id=channel.id,
-            verification_enabled=1
+            verification_enabled=True  # Changed from 1 to True
         )
         
         # Update in-memory cache
@@ -1160,13 +1160,24 @@ class PartnershipBenefitsModal(discord.ui.Modal, title="Partnership Benefits"):
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         
+        # Parse the date string to proper date format
+        try:
+            from datetime import datetime
+            date_obj = datetime.strptime(self.partnership_date.value, '%Y-%m-%d').date()
+        except ValueError:
+            await interaction.followup.send(
+                "❌ Invalid date format! Please use YYYY-MM-DD (e.g., 2025-01-15)",
+                ephemeral=True
+            )
+            return
+        
         # Create partnership in database
         partnership_data = {
             'server_name': self.parent_view.server_name,
             'invite_link': self.parent_view.invite_link,
             'description': self.parent_view.description,
             'representative': self.parent_view.representative,
-            'partnership_date': self.partnership_date.value,
+            'partnership_date': date_obj,  # Now a proper date object
             'partnership_type': self.parent_view.partnership_type,
             'benefits': self.benefits.value,
             'member_count': self.parent_view.member_count
