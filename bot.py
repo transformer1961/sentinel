@@ -8,6 +8,9 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 import json
 import database as db
+import random
+import string
+import aiohttp
 
 # Load environment variables
 load_dotenv()
@@ -247,7 +250,7 @@ async def on_guild_role_delete(role):
         if entry.target.id == role.id:
             user = entry.user
             
-            if user.bot or is_whitelisted(guild.id, user.id):
+            if user.bot or await is_whitelisted_check(guild.id, user.id):
                 return
             
             count = track_action(guild.id, user.id, 'role_delete')
@@ -269,7 +272,7 @@ async def on_member_ban(guild, user):
         if entry.target.id == user.id:
             banner = entry.user
             
-            if banner.bot or is_whitelisted(guild.id, banner.id):
+            if banner.bot or await is_whitelisted_check(guild.id, banner.id):
                 return
             
             count = track_action(guild.id, banner.id, 'member_ban')
@@ -777,6 +780,506 @@ async def on_member_join(member):
             f"⚠️ **POSSIBLE RAID DETECTED**\n"
             f"{count} accounts joined in {threshold['seconds']} seconds!\n"
             f"Consider enabling verification or lockdown.")
+
+# ============= ROBLOX VERIFICATION SYSTEM =============
+
+def generate_verification_code():
+    """Generate a random verification code"""
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+
+async def get_roblox_user_info(username):
+    """Get Roblox user info from username"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Get user ID from username
+            async with session.post(
+                'https://users.roblox.com/v1/usernames/users',
+                json={'usernames': [username], 'excludeBannedUsers': True}
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get('data') and len(data['data']) > 0:
+                        user_data = data['data'][0]
+                        user_id = user_data['id']
+                        
+                        # Get user profile description
+                        async with session.get(f'https://users.roblox.com/v1/users/{user_id}') as profile_resp:
+                            if profile_resp.status == 200:
+                                profile_data = await profile_resp.json()
+                                return {
+                                    'id': user_id,
+                                    'username': user_data['name'],
+                                    'displayName': user_data['displayName'],
+                                    'description': profile_data.get('description', '')
+                                }
+        return None
+    except Exception as e:
+        print(f'Error fetching Roblox user: {e}')
+        return None
+
+@bot.tree.command(name="setup_roblox_verification", description="Set up Roblox verification system")
+@app_commands.checks.has_permissions(administrator=True)
+async def setup_roblox_verification(interaction: discord.Interaction, channel: discord.TextChannel):
+    await interaction.response.defer(ephemeral=True)
+    
+    guild = interaction.guild
+    
+    # Create Unverified role if doesn't exist
+    unverified_role = discord.utils.get(guild.roles, name="Unverified")
+    if not unverified_role:
+        unverified_role = await guild.create_role(
+            name="Unverified",
+            color=discord.Color.light_grey(),
+            permissions=discord.Permissions.none(),
+            reason="Roblox verification - unverified members"
+        )
+    
+    # Create Verified role if doesn't exist
+    verified_role = discord.utils.get(guild.roles, name="Verified")
+    if not verified_role:
+        verified_role = await guild.create_role(
+            name="Verified",
+            color=discord.Color.green(),
+            reason="Roblox verification - verified members"
+        )
+    
+    # Update database
+    await db.set_server_config(
+        guild.id,
+        unverified_role_id=unverified_role.id,
+        verified_role_id=verified_role.id,
+        verification_channel_id=channel.id,
+        verification_enabled=1
+    )
+    
+    # Update in-memory cache
+    if guild.id not in server_configs:
+        server_configs[guild.id] = {}
+    server_configs[guild.id].update({
+        'unverified_role_id': unverified_role.id,
+        'verified_role_id': verified_role.id,
+        'verification_channel_id': channel.id,
+        'verification_enabled': True
+    })
+    
+    # Send verification message with button
+    view = RobloxVerificationView()
+    embed = discord.Embed(
+        title="🎮 Roblox Verification",
+        description=(
+            "Welcome! To access this server, you need to verify your Roblox account.\n\n"
+            "**How to verify:**\n"
+            "1. Click the button below\n"
+            "2. You'll receive a unique code\n"
+            "3. Add the code to your Roblox profile description\n"
+            "4. Click 'I've added the code'\n"
+            "5. Remove the code after verification!\n\n"
+            "✅ You'll be verified and gain access to the server!"
+        ),
+        color=discord.Color.blue()
+    )
+    await channel.send(embed=embed, view=view)
+    
+    await interaction.followup.send(
+        f"✅ Roblox verification system set up!\n\n"
+        f"• Unverified role: {unverified_role.mention}\n"
+        f"• Verified role: {verified_role.mention}\n"
+        f"• Verification channel: {channel.mention}\n\n"
+        f"New members will need to verify their Roblox account.",
+        ephemeral=True
+    )
+
+class RobloxVerificationView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+    
+    @discord.ui.button(label="Start Verification", style=discord.ButtonStyle.green, custom_id="roblox_verify_start")
+    async def start_verification(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Generate verification code
+        code = f"VERIFY-{generate_verification_code()}"
+        
+        # Save to database
+        await db.create_verification(interaction.guild.id, interaction.user.id, code)
+        
+        embed = discord.Embed(
+            title="🎮 Roblox Verification - Step 1",
+            description=(
+                f"**Your verification code:** `{code}`\n\n"
+                f"**Instructions:**\n"
+                f"1. Go to [Roblox Profile Settings](https://www.roblox.com/my/account#!/info)\n"
+                f"2. Add this code to your **'About' / 'Description'** section\n"
+                f"3. Save your changes\n"
+                f"4. Come back here and click 'I've added the code'\n\n"
+                f"⏰ This code expires if you leave and rejoin."
+            ),
+            color=discord.Color.blue()
+        )
+        
+        view = RobloxVerificationConfirmView()
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+class RobloxVerificationConfirmView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)  # 5 minute timeout
+    
+    @discord.ui.button(label="I've added the code", style=discord.ButtonStyle.green, custom_id="roblox_verify_confirm")
+    async def confirm_verification(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        
+        # Get verification data
+        verification = await db.get_verification(interaction.guild.id, interaction.user.id)
+        
+        if not verification:
+            await interaction.followup.send("❌ No verification in progress. Please start verification first.", ephemeral=True)
+            return
+        
+        if verification.get('verified'):
+            await interaction.followup.send("✅ You're already verified!", ephemeral=True)
+            return
+        
+        # Ask for Roblox username
+        await interaction.followup.send(
+            "Please reply with your **Roblox username** (type it in chat):",
+            ephemeral=True
+        )
+        
+        def check(m):
+            return m.author == interaction.user and m.channel == interaction.channel
+        
+        try:
+            msg = await bot.wait_for('message', timeout=60.0, check=check)
+            roblox_username = msg.content.strip()
+            
+            # Delete user's message
+            try:
+                await msg.delete()
+            except:
+                pass
+            
+            # Fetch Roblox profile
+            await interaction.followup.send("🔍 Checking your Roblox profile...", ephemeral=True)
+            
+            roblox_data = await get_roblox_user_info(roblox_username)
+            
+            if not roblox_data:
+                await interaction.followup.send(
+                    f"❌ Could not find Roblox user '{roblox_username}'. Please check the username and try again.",
+                    ephemeral=True
+                )
+                return
+            
+            # Check if code is in description
+            if verification['verification_code'] not in roblox_data['description']:
+                await interaction.followup.send(
+                    f"❌ Verification code not found in your Roblox profile description.\n\n"
+                    f"Make sure you added `{verification['verification_code']}` to your profile and saved it.",
+                    ephemeral=True
+                )
+                return
+            
+            # Verification successful!
+            await db.complete_verification(
+                interaction.guild.id,
+                interaction.user.id,
+                roblox_data['id'],
+                roblox_data['username']
+            )
+            
+            # Assign verified role
+            config = server_configs.get(interaction.guild.id, {})
+            verified_role_id = config.get('verified_role_id')
+            unverified_role_id = config.get('unverified_role_id')
+            
+            member = interaction.user
+            
+            if verified_role_id:
+                verified_role = interaction.guild.get_role(verified_role_id)
+                if verified_role and verified_role not in member.roles:
+                    await member.add_roles(verified_role, reason="Roblox verification successful")
+            
+            if unverified_role_id:
+                unverified_role = interaction.guild.get_role(unverified_role_id)
+                if unverified_role and unverified_role in member.roles:
+                    await member.remove_roles(unverified_role, reason="Roblox verification successful")
+            
+            embed = discord.Embed(
+                title="✅ Verification Successful!",
+                description=(
+                    f"**Roblox Account:** {roblox_data['username']}\n"
+                    f"**Display Name:** {roblox_data['displayName']}\n\n"
+                    f"You now have access to the server!\n\n"
+                    f"⚠️ Remember to remove the verification code from your Roblox profile."
+                ),
+                color=discord.Color.green()
+            )
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            
+            # Log verification
+            await db.add_log(
+                interaction.guild.id,
+                'roblox_verified',
+                member.id,
+                details={
+                    'roblox_username': roblox_data['username'],
+                    'roblox_id': roblox_data['id']
+                }
+            )
+            
+        except asyncio.TimeoutError:
+            await interaction.followup.send("❌ Verification timed out. Please try again.", ephemeral=True)
+
+# ============= PARTNERSHIP SYSTEM =============
+
+@bot.tree.command(name="partnership_submit", description="Submit a partnership application")
+async def partnership_submit(interaction: discord.Interaction):
+    """Open partnership submission form"""
+    # Check if user has Partnership Manager role or admin
+    has_permission = interaction.user.guild_permissions.administrator
+    
+    if not has_permission:
+        # Check for Partnership Manager role
+        partnership_role = discord.utils.get(interaction.guild.roles, name="Partnership Manager")
+        if partnership_role and partnership_role in interaction.user.roles:
+            has_permission = True
+    
+    if not has_permission:
+        await interaction.response.send_message(
+            "❌ You need the 'Partnership Manager' role or Administrator permission to use this command.",
+            ephemeral=True
+        )
+        return
+    
+    await interaction.response.send_modal(PartnershipSubmitModal())
+
+class PartnershipSubmitModal(discord.ui.Modal, title="Partnership Application"):
+    server_name = discord.ui.TextInput(
+        label="Server Name",
+        placeholder="Enter the partner server name",
+        required=True,
+        max_length=100
+    )
+    
+    invite_link = discord.ui.TextInput(
+        label="Server Invite Link",
+        placeholder="https://discord.gg/...",
+        required=True,
+        max_length=200
+    )
+    
+    description = discord.ui.TextInput(
+        label="Server Description/Ad",
+        placeholder="Describe the server and what makes it special",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=1000
+    )
+    
+    representative = discord.ui.TextInput(
+        label="Representative",
+        placeholder="Who should be contacted? (e.g., @username or User#1234)",
+        required=True,
+        max_length=100
+    )
+    
+    member_count = discord.ui.TextInput(
+        label="Approximate Member Count",
+        placeholder="e.g., 1000",
+        required=False,
+        max_length=10
+    )
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        # Show partnership type and benefits selection
+        view = PartnershipTypeView(
+            server_name=self.server_name.value,
+            invite_link=self.invite_link.value,
+            description=self.description.value,
+            representative=self.representative.value,
+            member_count=int(self.member_count.value) if self.member_count.value.isdigit() else 0
+        )
+        
+        await interaction.followup.send(
+            "Please select the partnership type and provide benefits:",
+            view=view,
+            ephemeral=True
+        )
+
+class PartnershipTypeView(discord.ui.View):
+    def __init__(self, server_name, invite_link, description, representative, member_count):
+        super().__init__(timeout=180)
+        self.server_name = server_name
+        self.invite_link = invite_link
+        self.description = description
+        self.representative = representative
+        self.member_count = member_count
+        self.partnership_type = None
+    
+    @discord.ui.select(
+        placeholder="Select Partnership Type",
+        options=[
+            discord.SelectOption(label="Standard", description="Regular partnership with basic benefits", value="standard"),
+            discord.SelectOption(label="Premium", description="Enhanced partnership with extra features", value="premium"),
+            discord.SelectOption(label="Featured", description="Top-tier partnership with maximum exposure", value="featured")
+        ]
+    )
+    async def select_type(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.partnership_type = select.values[0]
+        await interaction.response.send_modal(PartnershipBenefitsModal(self))
+
+class PartnershipBenefitsModal(discord.ui.Modal, title="Partnership Benefits"):
+    benefits = discord.ui.TextInput(
+        label="Partnership Benefits",
+        placeholder="What does each server get from this partnership?",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=500
+    )
+    
+    partnership_date = discord.ui.TextInput(
+        label="Partnership Start Date",
+        placeholder="YYYY-MM-DD (e.g., 2025-01-15)",
+        required=True,
+        max_length=10
+    )
+    
+    def __init__(self, parent_view):
+        super().__init__()
+        self.parent_view = parent_view
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        # Create partnership in database
+        partnership_data = {
+            'server_name': self.parent_view.server_name,
+            'invite_link': self.parent_view.invite_link,
+            'description': self.parent_view.description,
+            'representative': self.parent_view.representative,
+            'partnership_date': self.partnership_date.value,
+            'partnership_type': self.parent_view.partnership_type,
+            'benefits': self.benefits.value,
+            'member_count': self.parent_view.member_count
+        }
+        
+        partnership_id = await db.create_partnership(
+            interaction.guild.id,
+            partnership_data,
+            interaction.user.id
+        )
+        
+        # Send to approval channel
+        config = server_configs.get(interaction.guild.id, {})
+        log_channel_id = config.get('log_channel_id')
+        
+        if log_channel_id:
+            channel = interaction.guild.get_channel(log_channel_id)
+            if channel:
+                embed = discord.Embed(
+                    title="📋 New Partnership Application",
+                    color=discord.Color.gold()
+                )
+                embed.add_field(name="Server Name", value=partnership_data['server_name'], inline=True)
+                embed.add_field(name="Type", value=partnership_data['partnership_type'].title(), inline=True)
+                embed.add_field(name="Member Count", value=str(partnership_data['member_count']) if partnership_data['member_count'] else "N/A", inline=True)
+                embed.add_field(name="Invite Link", value=partnership_data['invite_link'], inline=False)
+                embed.add_field(name="Description", value=partnership_data['description'], inline=False)
+                embed.add_field(name="Representative", value=partnership_data['representative'], inline=True)
+                embed.add_field(name="Partnership Date", value=partnership_data['partnership_date'], inline=True)
+                embed.add_field(name="Benefits", value=partnership_data['benefits'], inline=False)
+                embed.add_field(name="Submitted By", value=interaction.user.mention, inline=True)
+                embed.set_footer(text=f"Partnership ID: {partnership_id}")
+                
+                view = PartnershipApprovalView(partnership_id)
+                await channel.send(embed=embed, view=view)
+        
+        await interaction.followup.send(
+            f"✅ Partnership application submitted! (ID: {partnership_id})\n"
+            f"Waiting for approval from Partnership Approvers.",
+            ephemeral=True
+        )
+
+class PartnershipApprovalView(discord.ui.View):
+    def __init__(self, partnership_id):
+        super().__init__(timeout=None)
+        self.partnership_id = partnership_id
+    
+    @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.green, custom_id=f"partner_approve")
+    async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Check if user has permission
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message(
+                "❌ You need 'Manage Server' permission to approve partnerships.",
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer()
+        
+        # Get partnership details
+        partnership = await db.get_partnership(self.partnership_id)
+        if not partnership:
+            await interaction.followup.send("❌ Partnership not found.", ephemeral=True)
+            return
+        
+        # Approve partnership
+        await db.approve_partnership(self.partnership_id, interaction.user.id)
+        
+        # Post ad in partnership channel (use log channel for now)
+        config = server_configs.get(interaction.guild.id, {})
+        log_channel_id = config.get('log_channel_id')
+        
+        if log_channel_id:
+            channel = interaction.guild.get_channel(log_channel_id)
+            if channel:
+                ad_embed = discord.Embed(
+                    title=f"🤝 {partnership['partner_server_name']}",
+                    description=partnership['partner_description'],
+                    color=discord.Color.blue()
+                )
+                ad_embed.add_field(name="Join Here", value=f"[Click to Join]({partnership['partner_invite_link']})", inline=False)
+                ad_embed.add_field(name="Representative", value=partnership['representative'], inline=True)
+                ad_embed.add_field(name="Partnership Type", value=partnership['partnership_type'].title(), inline=True)
+                ad_embed.set_footer(text=f"Partnership approved by {interaction.user.name}")
+                
+                await channel.send(embed=ad_embed)
+        
+        # Update original message
+        embed = interaction.message.embeds[0]
+        embed.color = discord.Color.green()
+        embed.title = "✅ Partnership Approved"
+        embed.add_field(name="Approved By", value=interaction.user.mention, inline=True)
+        
+        await interaction.message.edit(embed=embed, view=None)
+        
+        await interaction.followup.send("✅ Partnership approved and posted!", ephemeral=True)
+    
+    @discord.ui.button(label="❌ Deny", style=discord.ButtonStyle.red, custom_id=f"partner_deny")
+    async def deny_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Check if user has permission
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message(
+                "❌ You need 'Manage Server' permission to deny partnerships.",
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer()
+        
+        # Deny partnership
+        await db.deny_partnership(self.partnership_id, interaction.user.id)
+        
+        # Update original message
+        embed = interaction.message.embeds[0]
+        embed.color = discord.Color.red()
+        embed.title = "❌ Partnership Denied"
+        embed.add_field(name="Denied By", value=interaction.user.mention, inline=True)
+        
+        await interaction.message.edit(embed=embed, view=None)
+        
+        await interaction.followup.send("❌ Partnership denied.", ephemeral=True)
 
 # Run the bot
 bot.run(TOKEN)

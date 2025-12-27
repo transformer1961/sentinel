@@ -85,6 +85,44 @@ async def init_database():
                 )
             ''')
             
+            # Roblox verification table
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS roblox_verifications (
+                    id SERIAL PRIMARY KEY,
+                    server_id BIGINT,
+                    user_id BIGINT,
+                    roblox_id BIGINT,
+                    roblox_username TEXT,
+                    verification_code TEXT,
+                    verified BOOLEAN DEFAULT FALSE,
+                    verified_at TIMESTAMP,
+                    FOREIGN KEY (server_id) REFERENCES servers(server_id),
+                    UNIQUE(server_id, user_id)
+                )
+            ''')
+            
+            # Partnerships table
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS partnerships (
+                    id SERIAL PRIMARY KEY,
+                    server_id BIGINT,
+                    partner_server_name TEXT,
+                    partner_invite_link TEXT,
+                    partner_description TEXT,
+                    representative TEXT,
+                    partnership_date DATE,
+                    partnership_type TEXT,
+                    benefits TEXT,
+                    member_count INTEGER,
+                    submitted_by BIGINT,
+                    approved_by BIGINT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    approved_at TIMESTAMP,
+                    FOREIGN KEY (server_id) REFERENCES servers(server_id)
+                )
+            ''')
+            
             print("✅ PostgreSQL database initialized successfully")
     else:
         async with aiosqlite.connect(DATABASE_PATH) as db:
@@ -139,6 +177,44 @@ async def init_database():
                     target_id INTEGER,
                     details TEXT,
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (server_id) REFERENCES servers(server_id)
+                )
+            ''')
+            
+            # Roblox verification table
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS roblox_verifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    server_id INTEGER,
+                    user_id INTEGER,
+                    roblox_id INTEGER,
+                    roblox_username TEXT,
+                    verification_code TEXT,
+                    verified BOOLEAN DEFAULT 0,
+                    verified_at TIMESTAMP,
+                    FOREIGN KEY (server_id) REFERENCES servers(server_id),
+                    UNIQUE(server_id, user_id)
+                )
+            ''')
+            
+            # Partnerships table
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS partnerships (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    server_id INTEGER,
+                    partner_server_name TEXT,
+                    partner_invite_link TEXT,
+                    partner_description TEXT,
+                    representative TEXT,
+                    partnership_date DATE,
+                    partnership_type TEXT,
+                    benefits TEXT,
+                    member_count INTEGER,
+                    submitted_by INTEGER,
+                    approved_by INTEGER,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    approved_at TIMESTAMP,
                     FOREIGN KEY (server_id) REFERENCES servers(server_id)
                 )
             ''')
@@ -436,3 +512,186 @@ async def load_all_whitelists():
                     whitelists[server_id].add(row['entity_id'])
     
     return whitelists
+
+# Roblox Verification Functions
+async def create_verification(server_id, user_id, verification_code):
+    """Create a new verification entry"""
+    if USE_POSTGRES:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                '''INSERT INTO roblox_verifications (server_id, user_id, verification_code)
+                   VALUES ($1, $2, $3)
+                   ON CONFLICT(server_id, user_id) 
+                   DO UPDATE SET verification_code = $3, verified = FALSE''',
+                server_id, user_id, verification_code
+            )
+    else:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                '''INSERT OR REPLACE INTO roblox_verifications (server_id, user_id, verification_code, verified)
+                   VALUES (?, ?, ?, 0)''',
+                (server_id, user_id, verification_code)
+            )
+            await db.commit()
+
+async def get_verification(server_id, user_id):
+    """Get verification entry for a user"""
+    if USE_POSTGRES:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'SELECT * FROM roblox_verifications WHERE server_id = $1 AND user_id = $2',
+                server_id, user_id
+            )
+            if row:
+                return dict(row)
+            return None
+    else:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                'SELECT * FROM roblox_verifications WHERE server_id = ? AND user_id = ?',
+                (server_id, user_id)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return dict(row)
+                return None
+
+async def complete_verification(server_id, user_id, roblox_id, roblox_username):
+    """Mark verification as complete"""
+    if USE_POSTGRES:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                '''UPDATE roblox_verifications 
+                   SET verified = TRUE, roblox_id = $1, roblox_username = $2, verified_at = CURRENT_TIMESTAMP
+                   WHERE server_id = $3 AND user_id = $4''',
+                roblox_id, roblox_username, server_id, user_id
+            )
+    else:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                '''UPDATE roblox_verifications 
+                   SET verified = 1, roblox_id = ?, roblox_username = ?, verified_at = CURRENT_TIMESTAMP
+                   WHERE server_id = ? AND user_id = ?''',
+                (roblox_id, roblox_username, server_id, user_id)
+            )
+            await db.commit()
+
+async def is_verified(server_id, user_id):
+    """Check if user is verified"""
+    verification = await get_verification(server_id, user_id)
+    return verification and verification.get('verified')
+
+# Partnership Functions
+async def create_partnership(server_id, data, submitted_by):
+    """Create a new partnership submission"""
+    if USE_POSTGRES:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            partnership_id = await conn.fetchval(
+                '''INSERT INTO partnerships 
+                   (server_id, partner_server_name, partner_invite_link, partner_description, 
+                    representative, partnership_date, partnership_type, benefits, member_count, submitted_by)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                   RETURNING id''',
+                server_id, data['server_name'], data['invite_link'], data['description'],
+                data['representative'], data['partnership_date'], data['partnership_type'],
+                data['benefits'], data.get('member_count', 0), submitted_by
+            )
+            return partnership_id
+    else:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute(
+                '''INSERT INTO partnerships 
+                   (server_id, partner_server_name, partner_invite_link, partner_description, 
+                    representative, partnership_date, partnership_type, benefits, member_count, submitted_by)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (server_id, data['server_name'], data['invite_link'], data['description'],
+                 data['representative'], data['partnership_date'], data['partnership_type'],
+                 data['benefits'], data.get('member_count', 0), submitted_by)
+            )
+            await db.commit()
+            return cursor.lastrowid
+
+async def get_partnership(partnership_id):
+    """Get partnership by ID"""
+    if USE_POSTGRES:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow('SELECT * FROM partnerships WHERE id = $1', partnership_id)
+            if row:
+                return dict(row)
+            return None
+    else:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute('SELECT * FROM partnerships WHERE id = ?', (partnership_id,)) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return dict(row)
+                return None
+
+async def approve_partnership(partnership_id, approved_by):
+    """Approve a partnership"""
+    if USE_POSTGRES:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                '''UPDATE partnerships 
+                   SET status = 'approved', approved_by = $1, approved_at = CURRENT_TIMESTAMP
+                   WHERE id = $2''',
+                approved_by, partnership_id
+            )
+    else:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                '''UPDATE partnerships 
+                   SET status = 'approved', approved_by = ?, approved_at = CURRENT_TIMESTAMP
+                   WHERE id = ?''',
+                (approved_by, partnership_id)
+            )
+            await db.commit()
+
+async def deny_partnership(partnership_id, denied_by):
+    """Deny a partnership"""
+    if USE_POSTGRES:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                '''UPDATE partnerships 
+                   SET status = 'denied', approved_by = $1, approved_at = CURRENT_TIMESTAMP
+                   WHERE id = $2''',
+                denied_by, partnership_id
+            )
+    else:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                '''UPDATE partnerships 
+                   SET status = 'denied', approved_by = ?, approved_at = CURRENT_TIMESTAMP
+                   WHERE id = ?''',
+                (denied_by, partnership_id)
+            )
+            await db.commit()
+
+async def get_partnerships_by_status(server_id, status):
+    """Get all partnerships with a specific status"""
+    if USE_POSTGRES:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT * FROM partnerships WHERE server_id = $1 AND status = $2 ORDER BY created_at DESC',
+                server_id, status
+            )
+            return [dict(row) for row in rows]
+    else:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                'SELECT * FROM partnerships WHERE server_id = ? AND status = ? ORDER BY created_at DESC',
+                (server_id, status)
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
