@@ -820,74 +820,78 @@ async def get_roblox_user_info(username):
 @bot.tree.command(name="setup_roblox_verification", description="Set up Roblox verification system")
 @app_commands.checks.has_permissions(administrator=True)
 async def setup_roblox_verification(interaction: discord.Interaction, channel: discord.TextChannel):
-    await interaction.response.defer(ephemeral=True)
-    
-    guild = interaction.guild
-    
-    # Create Unverified role if doesn't exist
-    unverified_role = discord.utils.get(guild.roles, name="Unverified")
-    if not unverified_role:
-        unverified_role = await guild.create_role(
-            name="Unverified",
-            color=discord.Color.light_grey(),
-            permissions=discord.Permissions.none(),
-            reason="Roblox verification - unverified members"
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        guild = interaction.guild
+        
+        # Create Unverified role if doesn't exist
+        unverified_role = discord.utils.get(guild.roles, name="Unverified")
+        if not unverified_role:
+            unverified_role = await guild.create_role(
+                name="Unverified",
+                color=discord.Color.light_grey(),
+                permissions=discord.Permissions.none(),
+                reason="Roblox verification - unverified members"
+            )
+        
+        # Create Verified role if doesn't exist
+        verified_role = discord.utils.get(guild.roles, name="Verified")
+        if not verified_role:
+            verified_role = await guild.create_role(
+                name="Verified",
+                color=discord.Color.green(),
+                reason="Roblox verification - verified members"
+            )
+        
+        # Update database
+        await db.set_server_config(
+            guild.id,
+            unverified_role_id=unverified_role.id,
+            verified_role_id=verified_role.id,
+            verification_channel_id=channel.id,
+            verification_enabled=1
         )
-    
-    # Create Verified role if doesn't exist
-    verified_role = discord.utils.get(guild.roles, name="Verified")
-    if not verified_role:
-        verified_role = await guild.create_role(
-            name="Verified",
-            color=discord.Color.green(),
-            reason="Roblox verification - verified members"
+        
+        # Update in-memory cache
+        if guild.id not in server_configs:
+            server_configs[guild.id] = {}
+        server_configs[guild.id].update({
+            'unverified_role_id': unverified_role.id,
+            'verified_role_id': verified_role.id,
+            'verification_channel_id': channel.id,
+            'verification_enabled': True
+        })
+        
+        # Send verification message with button
+        view = RobloxVerificationView()
+        embed = discord.Embed(
+            title="🎮 Roblox Verification",
+            description=(
+                "Welcome! To access this server, you need to verify your Roblox account.\n\n"
+                "**How to verify:**\n"
+                "1. Click the button below\n"
+                "2. You'll receive a unique code\n"
+                "3. Add the code to your Roblox profile description\n"
+                "4. Click 'I've added the code'\n"
+                "5. Remove the code after verification!\n\n"
+                "✅ You'll be verified and gain access to the server!"
+            ),
+            color=discord.Color.blue()
         )
-    
-    # Update database
-    await db.set_server_config(
-        guild.id,
-        unverified_role_id=unverified_role.id,
-        verified_role_id=verified_role.id,
-        verification_channel_id=channel.id,
-        verification_enabled=1
-    )
-    
-    # Update in-memory cache
-    if guild.id not in server_configs:
-        server_configs[guild.id] = {}
-    server_configs[guild.id].update({
-        'unverified_role_id': unverified_role.id,
-        'verified_role_id': verified_role.id,
-        'verification_channel_id': channel.id,
-        'verification_enabled': True
-    })
-    
-    # Send verification message with button
-    view = RobloxVerificationView()
-    embed = discord.Embed(
-        title="🎮 Roblox Verification",
-        description=(
-            "Welcome! To access this server, you need to verify your Roblox account.\n\n"
-            "**How to verify:**\n"
-            "1. Click the button below\n"
-            "2. You'll receive a unique code\n"
-            "3. Add the code to your Roblox profile description\n"
-            "4. Click 'I've added the code'\n"
-            "5. Remove the code after verification!\n\n"
-            "✅ You'll be verified and gain access to the server!"
-        ),
-        color=discord.Color.blue()
-    )
-    await channel.send(embed=embed, view=view)
-    
-    await interaction.followup.send(
-        f"✅ Roblox verification system set up!\n\n"
-        f"• Unverified role: {unverified_role.mention}\n"
-        f"• Verified role: {verified_role.mention}\n"
-        f"• Verification channel: {channel.mention}\n\n"
-        f"New members will need to verify their Roblox account.",
-        ephemeral=True
-    )
+        await channel.send(embed=embed, view=view)
+        
+        await interaction.followup.send(
+            f"✅ Roblox verification system set up!\n\n"
+            f"• Unverified role: {unverified_role.mention}\n"
+            f"• Verified role: {verified_role.mention}\n"
+            f"• Verification channel: {channel.mention}\n\n"
+            f"New members will need to verify their Roblox account.",
+            ephemeral=True
+        )
+    except Exception as e:
+        print(f"Error in setup_roblox_verification: {e}")
+        await interaction.followup.send(f"❌ Error setting up verification: {str(e)}", ephemeral=True)
 
 class RobloxVerificationView(discord.ui.View):
     def __init__(self):
@@ -1034,23 +1038,27 @@ class RobloxVerificationConfirmView(discord.ui.View):
 @bot.tree.command(name="partnership_submit", description="Submit a partnership application")
 async def partnership_submit(interaction: discord.Interaction):
     """Open partnership submission form"""
-    # Check if user has Partnership Manager role or admin
-    has_permission = interaction.user.guild_permissions.administrator
-    
-    if not has_permission:
-        # Check for Partnership Manager role
-        partnership_role = discord.utils.get(interaction.guild.roles, name="Partnership Manager")
-        if partnership_role and partnership_role in interaction.user.roles:
-            has_permission = True
-    
-    if not has_permission:
-        await interaction.response.send_message(
-            "❌ You need the 'Partnership Manager' role or Administrator permission to use this command.",
-            ephemeral=True
-        )
-        return
-    
-    await interaction.response.send_modal(PartnershipSubmitModal())
+    try:
+        # Check if user has Partnership Manager role or admin
+        has_permission = interaction.user.guild_permissions.administrator
+        
+        if not has_permission:
+            # Check for Partnership Manager role
+            partnership_role = discord.utils.get(interaction.guild.roles, name="Partnership Manager")
+            if partnership_role and partnership_role in interaction.user.roles:
+                has_permission = True
+        
+        if not has_permission:
+            await interaction.response.send_message(
+                "❌ You need the 'Partnership Manager' role or Administrator permission to use this command.",
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.send_modal(PartnershipSubmitModal())
+    except Exception as e:
+        print(f"Error in partnership_submit: {e}")
+        await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
 
 class PartnershipSubmitModal(discord.ui.Modal, title="Partnership Application"):
     server_name = discord.ui.TextInput(
