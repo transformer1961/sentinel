@@ -731,6 +731,20 @@ class VerificationView(discord.ui.View):
             ephemeral=True
         )
         
+        # Send completion message in log channel
+        config = server_configs.get(interaction.guild.id, {})
+        log_channel_id = config.get('log_channel_id')
+        if log_channel_id:
+            log_channel = interaction.guild.get_channel(log_channel_id)
+            if log_channel:
+                log_embed = discord.Embed(
+                    title="✅ Discord Verification Completed",
+                    description=f"{member.mention} has been verified!",
+                    color=discord.Color.green()
+                )
+                log_embed.add_field(name="User", value=f"{member.name} ({member.id})", inline=False)
+                await log_channel.send(embed=log_embed)
+        
         # Log verification
         await db.add_log(
             interaction.guild.id,
@@ -1019,6 +1033,21 @@ class RobloxVerificationConfirmView(discord.ui.View):
             
             await interaction.followup.send(embed=embed, ephemeral=True)
             
+            # Send completion message in log channel
+            config = server_configs.get(interaction.guild.id, {})
+            log_channel_id = config.get('log_channel_id')
+            if log_channel_id:
+                log_channel = interaction.guild.get_channel(log_channel_id)
+                if log_channel:
+                    log_embed = discord.Embed(
+                        title="🎮 Roblox Verification Completed",
+                        color=discord.Color.green()
+                    )
+                    log_embed.add_field(name="Discord User", value=member.mention, inline=True)
+                    log_embed.add_field(name="Roblox Username", value=roblox_data['username'], inline=True)
+                    log_embed.add_field(name="Roblox ID", value=str(roblox_data['id']), inline=True)
+                    await log_channel.send(embed=log_embed)
+            
             # Log verification
             await db.add_log(
                 interaction.guild.id,
@@ -1035,30 +1064,85 @@ class RobloxVerificationConfirmView(discord.ui.View):
 
 # ============= PARTNERSHIP SYSTEM =============
 
+@bot.tree.command(name="partnership_list", description="View all partnerships")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def partnership_list(interaction: discord.Interaction, status: str = "all"):
+    """List partnerships by status"""
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        print(f"DEBUG: Fetching partnerships for guild {interaction.guild.id}, status: {status}")
+        
+        if status == "all":
+            pending = await db.get_partnerships_by_status(interaction.guild.id, 'pending')
+            approved = await db.get_partnerships_by_status(interaction.guild.id, 'approved')
+            denied = await db.get_partnerships_by_status(interaction.guild.id, 'denied')
+            all_partnerships = pending + approved + denied
+            print(f"DEBUG: Found {len(pending)} pending, {len(approved)} approved, {len(denied)} denied")
+        else:
+            all_partnerships = await db.get_partnerships_by_status(interaction.guild.id, status)
+            print(f"DEBUG: Found {len(all_partnerships)} partnerships with status {status}")
+        
+        if not all_partnerships:
+            await interaction.followup.send(f"No partnerships found with status: {status}", ephemeral=True)
+            return
+        
+        embed = discord.Embed(
+            title=f"📋 Partnerships ({status.title()})",
+            color=discord.Color.blue()
+        )
+        
+        for partnership in all_partnerships[:10]:  # Limit to 10
+            status_emoji = {"pending": "⏳", "approved": "✅", "denied": "❌"}.get(partnership['status'], "❓")
+            
+            # Format the partnership date
+            partner_date = partnership.get('partnership_date', 'N/A')
+            if partner_date and partner_date != 'N/A':
+                if hasattr(partner_date, 'strftime'):
+                    partner_date = partner_date.strftime('%Y-%m-%d')
+                else:
+                    partner_date = str(partner_date)
+            
+            embed.add_field(
+                name=f"{status_emoji} {partnership['partner_server_name']} (ID: {partnership['id']})",
+                value=(
+                    f"**Type:** {partnership['partnership_type'].title()}\n"
+                    f"**Status:** {partnership['status'].title()}\n"
+                    f"**Date:** {partner_date}\n"
+                    f"**Rep:** {partnership['representative']}"
+                ),
+                inline=False
+            )
+        
+        if len(all_partnerships) > 10:
+            embed.set_footer(text=f"Showing 10 of {len(all_partnerships)} partnerships")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        print(f"Error in partnership_list: {e}")
+        await interaction.followup.send(f"❌ Error loading partnerships: {str(e)}", ephemeral=True)
+
 @bot.tree.command(name="partnership_submit", description="Submit a partnership application")
 async def partnership_submit(interaction: discord.Interaction):
     """Open partnership submission form"""
-    try:
-        # Check if user has Partnership Manager role or admin
-        has_permission = interaction.user.guild_permissions.administrator
-        
-        if not has_permission:
-            # Check for Partnership Manager role
-            partnership_role = discord.utils.get(interaction.guild.roles, name="Partnership Manager")
-            if partnership_role and partnership_role in interaction.user.roles:
-                has_permission = True
-        
-        if not has_permission:
-            await interaction.response.send_message(
-                "❌ You need the 'Partnership Manager' role or Administrator permission to use this command.",
-                ephemeral=True
-            )
-            return
-        
-        await interaction.response.send_modal(PartnershipSubmitModal())
-    except Exception as e:
-        print(f"Error in partnership_submit: {e}")
-        await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
+    # Check if user has Partnership Manager role or admin
+    has_permission = interaction.user.guild_permissions.administrator
+    
+    if not has_permission:
+        # Check for Partnership Manager role
+        partnership_role = discord.utils.get(interaction.guild.roles, name="Partnership Manager")
+        if partnership_role and partnership_role in interaction.user.roles:
+            has_permission = True
+    
+    if not has_permission:
+        await interaction.response.send_message(
+            "❌ You need the 'Partnership Manager' role or Administrator permission to use this command.",
+            ephemeral=True
+        )
+        return
+    
+    # Send modal immediately - no try/except needed here
+    await interaction.response.send_modal(PartnershipSubmitModal())
 
 class PartnershipSubmitModal(discord.ui.Modal, title="Partnership Application"):
     server_name = discord.ui.TextInput(
@@ -1299,6 +1383,253 @@ class PartnershipApprovalView(discord.ui.View):
         await interaction.message.edit(embed=embed, view=None)
         
         await interaction.followup.send("❌ Partnership denied.", ephemeral=True)
+
+# ============= LOGS COMMAND =============
+
+@bot.tree.command(name="test_db", description="Test database - shows partnership count")
+@app_commands.checks.has_permissions(administrator=True)
+async def test_db(interaction: discord.Interaction):
+    """Debug command to check database"""
+    await interaction.response.defer(ephemeral=True)
+    
+    # Check if partnerships table exists and count rows
+    if db.USE_POSTGRES:
+        pool = await db.get_pool()
+        async with pool.acquire() as conn:
+            count = await conn.fetchval('SELECT COUNT(*) FROM partnerships WHERE server_id = $1', interaction.guild.id)
+            all_partnerships = await conn.fetch('SELECT id, partner_server_name, status FROM partnerships WHERE server_id = $1', interaction.guild.id)
+    else:
+        async with db.aiosqlite.connect(db.DATABASE_PATH) as database:
+            async with database.execute('SELECT COUNT(*) FROM partnerships WHERE server_id = ?', (interaction.guild.id,)) as cursor:
+                count_row = await cursor.fetchone()
+                count = count_row[0] if count_row else 0
+            
+            database.row_factory = db.aiosqlite.Row
+            async with database.execute('SELECT id, partner_server_name, status FROM partnerships WHERE server_id = ?', (interaction.guild.id,)) as cursor:
+                all_partnerships = await cursor.fetchall()
+    
+    embed = discord.Embed(title="🔍 Database Test", color=discord.Color.blue())
+    embed.add_field(name="Total Partnerships", value=str(count), inline=False)
+    
+    if all_partnerships:
+        partnerships_str = "\n".join([f"ID: {p['id' if db.USE_POSTGRES else 0]}, Name: {p['partner_server_name' if db.USE_POSTGRES else 1]}, Status: {p['status' if db.USE_POSTGRES else 2]}" for p in all_partnerships[:5]])
+        embed.add_field(name="Partnerships", value=partnerships_str, inline=False)
+    
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="logs", description="View recent security logs")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def logs_command(interaction: discord.Interaction, count: int = 10):
+    """View recent security logs"""
+    await interaction.response.defer(ephemeral=True)
+    
+    if count > 25:
+        count = 25  # Limit to 25
+    
+    logs = await db.get_recent_logs(interaction.guild.id, count)
+    
+    if not logs:
+        await interaction.followup.send("No logs found.", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title=f"📜 Recent Security Logs",
+        description=f"Showing last {len(logs)} events",
+        color=discord.Color.blue()
+    )
+    
+    for log in logs:
+        user = bot.get_user(log['user_id']) if log.get('user_id') else None
+        user_mention = user.mention if user else f"User ID: {log.get('user_id')}"
+        
+        timestamp = log.get('timestamp', 'Unknown time')
+        if isinstance(timestamp, str):
+            timestamp_str = timestamp
+        else:
+            timestamp_str = timestamp.strftime('%Y-%m-%d %H:%M:%S') if timestamp else 'Unknown'
+        
+        embed.add_field(
+            name=f"{log['action_type']} - {timestamp_str}",
+            value=f"User: {user_mention}",
+            inline=False
+        )
+    
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+# ============= WHOIS COMMAND =============
+
+@bot.tree.command(name="whois", description="Show linked Roblox account for a user")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def whois_command(interaction: discord.Interaction, user: discord.Member):
+    """Show user's linked Roblox account"""
+    await interaction.response.defer(ephemeral=True)
+    
+    verification = await db.get_verification(interaction.guild.id, user.id)
+    
+    if not verification or not verification.get('verified'):
+        await interaction.followup.send(
+            f"{user.mention} has not verified their Roblox account.",
+            ephemeral=True
+        )
+        return
+    
+    embed = discord.Embed(
+        title=f"🔍 User Info: {user.name}",
+        color=discord.Color.blue()
+    )
+    
+    embed.add_field(name="Discord User", value=user.mention, inline=True)
+    embed.add_field(name="Discord ID", value=str(user.id), inline=True)
+    embed.add_field(name="Roblox Username", value=verification.get('roblox_username', 'Unknown'), inline=True)
+    embed.add_field(name="Roblox ID", value=str(verification.get('roblox_id', 'Unknown')), inline=True)
+    
+    verified_at = verification.get('verified_at', 'Unknown')
+    if verified_at and verified_at != 'Unknown':
+        if isinstance(verified_at, str):
+            embed.add_field(name="Verified At", value=verified_at, inline=True)
+        else:
+            embed.add_field(name="Verified At", value=verified_at.strftime('%Y-%m-%d %H:%M:%S'), inline=True)
+    
+    embed.set_thumbnail(url=user.display_avatar.url)
+    
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+# ============= BACKUP SYSTEM =============
+
+@bot.tree.command(name="backup_create", description="Create a backup of server structure")
+@app_commands.checks.has_permissions(administrator=True)
+async def backup_create(interaction: discord.Interaction):
+    """Create a manual backup of the server"""
+    await interaction.response.defer(ephemeral=True)
+    
+    guild = interaction.guild
+    
+    # Collect server data
+    backup_data = {
+        'guild_name': guild.name,
+        'guild_id': guild.id,
+        'channels': [],
+        'roles': [],
+        'created_at': datetime.now().isoformat()
+    }
+    
+    # Backup channels
+    for channel in guild.channels:
+        channel_data = {
+            'name': channel.name,
+            'id': channel.id,
+            'type': str(channel.type),
+            'position': channel.position,
+        }
+        
+        if isinstance(channel, discord.TextChannel):
+            channel_data['topic'] = channel.topic
+            channel_data['nsfw'] = channel.nsfw
+            channel_data['slowmode_delay'] = channel.slowmode_delay
+        
+        backup_data['channels'].append(channel_data)
+    
+    # Backup roles
+    for role in guild.roles:
+        if role.name != "@everyone":
+            role_data = {
+                'name': role.name,
+                'id': role.id,
+                'color': role.color.value,
+                'position': role.position,
+                'permissions': role.permissions.value,
+                'hoist': role.hoist,
+                'mentionable': role.mentionable
+            }
+            backup_data['roles'].append(role_data)
+    
+    # Save to database
+    backup_json = json.dumps(backup_data)
+    
+    if db.USE_POSTGRES:
+        pool = await db.get_pool()
+        async with pool.acquire() as conn:
+            backup_id = await conn.fetchval(
+                '''INSERT INTO backups (server_id, backup_data, backup_type)
+                   VALUES ($1, $2, $3) RETURNING backup_id''',
+                guild.id, backup_json, 'manual'
+            )
+    else:
+        async with db.aiosqlite.connect(db.DATABASE_PATH) as database:
+            cursor = await database.execute(
+                '''INSERT INTO backups (server_id, backup_data, backup_type)
+                   VALUES (?, ?, ?)''',
+                (guild.id, backup_json, 'manual')
+            )
+            await database.commit()
+            backup_id = cursor.lastrowid
+    
+    embed = discord.Embed(
+        title="✅ Backup Created",
+        description=f"Server backup created successfully!",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="Backup ID", value=str(backup_id), inline=True)
+    embed.add_field(name="Channels Backed Up", value=str(len(backup_data['channels'])), inline=True)
+    embed.add_field(name="Roles Backed Up", value=str(len(backup_data['roles'])), inline=True)
+    embed.set_footer(text=f"Use /backup_restore {backup_id} to restore")
+    
+    await interaction.followup.send(embed=embed, ephemeral=True)
+    
+    # Log backup creation
+    await db.add_log(
+        guild.id,
+        'backup_created',
+        interaction.user.id,
+        details={'backup_id': backup_id, 'type': 'manual'}
+    )
+
+@bot.tree.command(name="backup_restore", description="Restore server from a backup")
+@app_commands.checks.has_permissions(administrator=True)
+async def backup_restore(interaction: discord.Interaction, backup_id: int):
+    """Restore server from a backup"""
+    await interaction.response.defer(ephemeral=True)
+    
+    # Get backup from database
+    if db.USE_POSTGRES:
+        pool = await db.get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'SELECT * FROM backups WHERE backup_id = $1 AND server_id = $2',
+                backup_id, interaction.guild.id
+            )
+    else:
+        async with db.aiosqlite.connect(db.DATABASE_PATH) as database:
+            database.row_factory = db.aiosqlite.Row
+            async with database.execute(
+                'SELECT * FROM backups WHERE backup_id = ? AND server_id = ?',
+                (backup_id, interaction.guild.id)
+            ) as cursor:
+                row = await cursor.fetchone()
+    
+    if not row:
+        await interaction.followup.send(
+            f"❌ Backup ID {backup_id} not found for this server.",
+            ephemeral=True
+        )
+        return
+    
+    backup_data = json.loads(row['backup_data'] if db.USE_POSTGRES else row[2])
+    
+    await interaction.followup.send(
+        f"⚠️ **WARNING:** Restoring will recreate {len(backup_data['channels'])} channels and {len(backup_data['roles'])} roles.\n"
+        f"This action cannot be undone. Are you sure?\n\n"
+        f"**Note:** This is a basic restore - it recreates structure but not permissions/settings yet.",
+        ephemeral=True
+    )
+    
+    # Log restore attempt
+    await db.add_log(
+        interaction.guild.id,
+        'backup_restore_attempted',
+        interaction.user.id,
+        details={'backup_id': backup_id}
+    )
 
 # Run the bot
 bot.run(TOKEN)

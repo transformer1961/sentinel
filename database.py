@@ -123,6 +123,18 @@ async def init_database():
                 )
             ''')
             
+            # Backups table
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS backups (
+                    backup_id SERIAL PRIMARY KEY,
+                    server_id BIGINT,
+                    backup_data TEXT,
+                    backup_type TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (server_id) REFERENCES servers(server_id)
+                )
+            ''')
+            
             print("✅ PostgreSQL database initialized successfully")
     else:
         async with aiosqlite.connect(DATABASE_PATH) as db:
@@ -215,6 +227,18 @@ async def init_database():
                     status TEXT DEFAULT 'pending',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     approved_at TIMESTAMP,
+                    FOREIGN KEY (server_id) REFERENCES servers(server_id)
+                )
+            ''')
+            
+            # Backups table
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS backups (
+                    backup_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    server_id INTEGER,
+                    backup_data TEXT,
+                    backup_type TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (server_id) REFERENCES servers(server_id)
                 )
             ''')
