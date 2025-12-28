@@ -308,6 +308,7 @@ async def on_member_join(member):
             f"{count} accounts joined in {threshold['seconds']} seconds!\n"
             f"Consider enabling verification or lockdown.")
 
+
 # Setup Command
 @bot.tree.command(name="setup", description="Initial bot setup wizard")
 @app_commands.checks.has_permissions(administrator=True)
@@ -1384,6 +1385,364 @@ class PartnershipApprovalView(discord.ui.View):
         
         await interaction.followup.send("❌ Partnership denied.", ephemeral=True)
 
+# ============= ADDITIONAL PARTNERSHIP COMMANDS =============
+
+@bot.tree.command(name="partnership_delete", description="Delete a partnership")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def partnership_delete(interaction: discord.Interaction, partnership_id: int):
+    """Delete a partnership by ID"""
+    await interaction.response.defer(ephemeral=True)
+    
+    # Check if partnership exists
+    partnership = await db.get_partnership(partnership_id)
+    if not partnership or partnership['server_id'] != interaction.guild.id:
+        await interaction.followup.send(f"❌ Partnership ID {partnership_id} not found.", ephemeral=True)
+        return
+    
+    await db.delete_partnership(partnership_id)
+    
+    await interaction.followup.send(
+        f"✅ Deleted partnership: {partnership['partner_server_name']} (ID: {partnership_id})",
+        ephemeral=True
+    )
+    
+    # Log deletion
+    await db.add_log(
+        interaction.guild.id,
+        'partnership_deleted',
+        interaction.user.id,
+        details={'partnership_id': partnership_id, 'server_name': partnership['partner_server_name']}
+    )
+
+@bot.tree.command(name="partnership_view", description="View full partnership details")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def partnership_view(interaction: discord.Interaction, partnership_id: int):
+    """View detailed info about a partnership"""
+    await interaction.response.defer(ephemeral=True)
+    
+    partnership = await db.get_partnership(partnership_id)
+    if not partnership or partnership['server_id'] != interaction.guild.id:
+        await interaction.followup.send(f"❌ Partnership ID {partnership_id} not found.", ephemeral=True)
+        return
+    
+    # Format date
+    partner_date = partnership.get('partnership_date', 'N/A')
+    if partner_date and partner_date != 'N/A':
+        if hasattr(partner_date, 'strftime'):
+            partner_date = partner_date.strftime('%Y-%m-%d')
+        else:
+            partner_date = str(partner_date)
+    
+    status_color = {
+        'pending': discord.Color.gold(),
+        'approved': discord.Color.green(),
+        'denied': discord.Color.red()
+    }.get(partnership['status'], discord.Color.blue())
+    
+    embed = discord.Embed(
+        title=f"📋 Partnership: {partnership['partner_server_name']}",
+        color=status_color
+    )
+    embed.add_field(name="Partnership ID", value=str(partnership['id']), inline=True)
+    embed.add_field(name="Status", value=partnership['status'].title(), inline=True)
+    embed.add_field(name="Type", value=partnership['partnership_type'].title(), inline=True)
+    embed.add_field(name="Invite Link", value=partnership['partner_invite_link'], inline=False)
+    embed.add_field(name="Description", value=partnership['partner_description'], inline=False)
+    embed.add_field(name="Representative", value=partnership['representative'], inline=True)
+    embed.add_field(name="Partnership Date", value=partner_date, inline=True)
+    embed.add_field(name="Member Count", value=str(partnership.get('member_count', 'N/A')), inline=True)
+    embed.add_field(name="Benefits", value=partnership['benefits'], inline=False)
+    
+    submitted_by = bot.get_user(partnership['submitted_by'])
+    embed.add_field(name="Submitted By", value=submitted_by.mention if submitted_by else f"User ID: {partnership['submitted_by']}", inline=True)
+    
+    if partnership.get('approved_by'):
+        approved_by = bot.get_user(partnership['approved_by'])
+        embed.add_field(name="Approved/Denied By", value=approved_by.mention if approved_by else f"User ID: {partnership['approved_by']}", inline=True)
+    
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="set_partnership_channel", description="Set dedicated channel for partnership ads")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_partnership_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    """Set partnership ad channel"""
+    await db.update_server_field(interaction.guild.id, 'partnership_channel_id', channel.id)
+    
+    if interaction.guild.id not in server_configs:
+        server_configs[interaction.guild.id] = {}
+    server_configs[interaction.guild.id]['partnership_channel_id'] = channel.id
+    
+    await interaction.response.send_message(
+        f"✅ Partnership ad channel set to {channel.mention}",
+        ephemeral=True
+    )
+
+# ============= THREAT LEVEL SYSTEM =============
+
+THREAT_LEVELS = {
+    0: {"name": "🟢 Clear", "color": discord.Color.green(), "description": "Normal operations"},
+    1: {"name": "🟡 Elevated", "color": discord.Color.gold(), "description": "Minor threat detected"},
+    2: {"name": "🟠 High", "color": discord.Color.orange(), "description": "Serious threat - Lockdown engaged"},
+    3: {"name": "🔴 Alpha", "color": discord.Color.red(), "description": "FULL SECURITY BREACH"}
+}
+
+async def apply_threat_level(guild, level, set_by_user):
+    """Apply threat level actions to server"""
+    config = server_configs.get(guild.id, {})
+    
+    if level == 0:  # Clear - Restore normal
+        # Unlock all channels
+        for channel in guild.channels:
+            if isinstance(channel, discord.TextChannel):
+                await channel.set_permissions(guild.default_role, send_messages=None, add_reactions=None)
+            elif isinstance(channel, discord.VoiceChannel):
+                await channel.set_permissions(guild.default_role, connect=None)
+        
+        await send_alert(guild, f"🟢 **Threat Level: CLEAR**\nServer restored to normal operations by {set_by_user.mention}")
+    
+    elif level == 1:  # Elevated
+        # Enable verification
+        await db.update_server_field(guild.id, 'verification_enabled', True)
+        server_configs[guild.id]['verification_enabled'] = True
+        
+        # Alert on-duty staff
+        onduty_role_id = config.get('onduty_role_id')
+        if onduty_role_id:
+            onduty_role = guild.get_role(onduty_role_id)
+            if onduty_role:
+                await send_alert(guild, 
+                    f"🟡 **Threat Level: ELEVATED**\n"
+                    f"{onduty_role.mention} - Increased security measures active.\n"
+                    f"Set by: {set_by_user.mention}")
+        else:
+            await send_alert(guild, f"🟡 **Threat Level: ELEVATED**\nSet by: {set_by_user.mention}")
+    
+    elif level == 2:  # High
+        # Lock all text channels
+        for channel in guild.text_channels:
+            try:
+                await channel.set_permissions(guild.default_role, send_messages=False, add_reactions=False)
+            except:
+                pass
+        
+        # Lock all voice channels
+        for channel in guild.voice_channels:
+            try:
+                await channel.set_permissions(guild.default_role, connect=False)
+            except:
+                pass
+        
+        # Alert on-duty staff via DM
+        onduty_role_id = config.get('onduty_role_id')
+        if onduty_role_id:
+            onduty_role = guild.get_role(onduty_role_id)
+            if onduty_role:
+                for member in guild.members:
+                    if onduty_role in member.roles:
+                        try:
+                            await member.send(
+                                f"🟠 **HIGH THREAT ALERT** 🟠\n"
+                                f"Server: **{guild.name}**\n"
+                                f"All channels have been locked.\n"
+                                f"Set by: {set_by_user.mention}"
+                            )
+                        except:
+                            pass
+        
+        await send_alert(guild, 
+            f"🟠 **Threat Level: HIGH**\n"
+            f"⚠️ Server lockdown engaged!\n"
+            f"All text and voice channels locked.\n"
+            f"Set by: {set_by_user.mention}")
+    
+    elif level == 3:  # Alpha - Full lockdown
+        # Lock ALL channels
+        for channel in guild.text_channels:
+            try:
+                await channel.set_permissions(guild.default_role, send_messages=False, add_reactions=False, view_channel=False)
+            except:
+                pass
+        
+        # Lock and kick from voice channels
+        for channel in guild.voice_channels:
+            try:
+                await channel.set_permissions(guild.default_role, connect=False, view_channel=False)
+                # Kick all members from voice
+                for member in channel.members:
+                    if not member.guild_permissions.administrator:
+                        try:
+                            await member.move_to(None)
+                        except:
+                            pass
+            except:
+                pass
+        
+        # Alert ALL staff (on-duty + off-duty)
+        allstaff_role_id = config.get('allstaff_role_id')
+        if allstaff_role_id:
+            allstaff_role = guild.get_role(allstaff_role_id)
+            if allstaff_role:
+                for member in guild.members:
+                    if allstaff_role in member.roles:
+                        try:
+                            await member.send(
+                                f"🚨 **ALPHA ALERT - SECURITY BREACH** 🚨\n"
+                                f"Server: **{guild.name}**\n"
+                                f"FULL LOCKDOWN IN EFFECT\n"
+                                f"All channels locked. All users kicked from voice.\n"
+                                f"RESPOND IMMEDIATELY\n"
+                                f"Set by: {set_by_user.mention}"
+                            )
+                        except:
+                            pass
+        
+        await send_alert(guild, 
+            f"🔴 **THREAT LEVEL: ALPHA** 🔴\n"
+            f"🚨 FULL SECURITY BREACH 🚨\n"
+            f"Complete server lockdown engaged.\n"
+            f"All channels hidden and locked.\n"
+            f"All users kicked from voice.\n"
+            f"Set by: {set_by_user.mention}")
+
+@bot.tree.command(name="threat_set", description="Set server threat level")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.choices(level=[
+    app_commands.Choice(name="🟢 Clear - Normal operations", value=0),
+    app_commands.Choice(name="🟡 Elevated - Minor threat detected", value=1),
+    app_commands.Choice(name="🟠 High - Serious threat, lockdown engaged", value=2),
+    app_commands.Choice(name="🔴 Alpha - FULL SECURITY BREACH", value=3)
+])
+async def threat_set(interaction: discord.Interaction, level: int, reason: str):
+    """Set threat level (0=Clear, 1=Elevated, 2=High, 3=Alpha)"""
+    if level not in [0, 1, 2, 3]:
+        await interaction.response.send_message(
+            "❌ Invalid threat level! Use: 0 (Clear), 1 (Elevated), 2 (High), 3 (Alpha)",
+            ephemeral=True
+        )
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    # Save to database
+    await db.set_threat_level(interaction.guild.id, level, reason, interaction.user.id)
+    
+    # Apply threat level actions
+    await apply_threat_level(interaction.guild, level, interaction.user)
+    
+    level_info = THREAT_LEVELS[level]
+    await interaction.followup.send(
+        f"{level_info['name']} **Threat Level Set**\n"
+        f"Reason: {reason}\n"
+        f"Actions have been applied to the server.",
+        ephemeral=True
+    )
+    
+    # Log threat level change
+    await db.add_log(
+        interaction.guild.id,
+        'threat_level_changed',
+        interaction.user.id,
+        details={'level': level, 'reason': reason}
+    )
+
+@bot.tree.command(name="threat_status", description="View current threat level")
+async def threat_status(interaction: discord.Interaction):
+    """Show current threat level"""
+    await interaction.response.defer(ephemeral=True)
+    
+    current = await db.get_current_threat_level(interaction.guild.id)
+    level = current['threat_level']
+    level_info = THREAT_LEVELS[level]
+    
+    embed = discord.Embed(
+        title=f"{level_info['name']} - Threat Level Status",
+        description=level_info['description'],
+        color=level_info['color']
+    )
+    
+    embed.add_field(name="Current Level", value=str(level), inline=True)
+    embed.add_field(name="Reason", value=current.get('reason', 'N/A'), inline=True)
+    
+    if current.get('set_by'):
+        set_by_user = bot.get_user(current['set_by'])
+        embed.add_field(name="Set By", value=set_by_user.mention if set_by_user else f"User ID: {current['set_by']}", inline=True)
+    
+    if current.get('set_at'):
+        set_at = current['set_at']
+        if hasattr(set_at, 'strftime'):
+            embed.add_field(name="Set At", value=set_at.strftime('%Y-%m-%d %H:%M:%S'), inline=False)
+    
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="threat_history", description="View threat level change history")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def threat_history(interaction: discord.Interaction, count: int = 10):
+    """Show threat level history"""
+    await interaction.response.defer(ephemeral=True)
+    
+    history = await db.get_threat_history(interaction.guild.id, count)
+    
+    if not history:
+        await interaction.followup.send("No threat level history found.", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title="📜 Threat Level History",
+        color=discord.Color.blue()
+    )
+    
+    for entry in history:
+        level = entry['threat_level']
+        level_info = THREAT_LEVELS[level]
+        
+        set_by_user = bot.get_user(entry['set_by']) if entry.get('set_by') else None
+        set_by_str = set_by_user.mention if set_by_user else f"User ID: {entry.get('set_by')}"
+        
+        set_at = entry.get('set_at', 'Unknown')
+        if hasattr(set_at, 'strftime'):
+            set_at_str = set_at.strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            set_at_str = str(set_at)
+        
+        embed.add_field(
+            name=f"{level_info['name']} - {set_at_str}",
+            value=f"Reason: {entry.get('reason', 'N/A')}\nSet by: {set_by_str}",
+            inline=False
+        )
+    
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="set_onduty_role", description="Set on-duty staff role for threat alerts")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_onduty_role(interaction: discord.Interaction, role: discord.Role):
+    """Set on-duty staff role"""
+    await db.update_server_field(interaction.guild.id, 'onduty_role_id', role.id)
+    
+    if interaction.guild.id not in server_configs:
+        server_configs[interaction.guild.id] = {}
+    server_configs[interaction.guild.id]['onduty_role_id'] = role.id
+    
+    await interaction.response.send_message(
+        f"✅ On-duty staff role set to {role.mention}\n"
+        f"This role will be alerted for Elevated and High threat levels.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="set_allstaff_role", description="Set all staff role for Alpha alerts")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_allstaff_role(interaction: discord.Interaction, role: discord.Role):
+    """Set all staff role"""
+    await db.update_server_field(interaction.guild.id, 'allstaff_role_id', role.id)
+    
+    if interaction.guild.id not in server_configs:
+        server_configs[interaction.guild.id] = {}
+    server_configs[interaction.guild.id]['allstaff_role_id'] = role.id
+    
+    await interaction.response.send_message(
+        f"✅ All staff role set to {role.mention}\n"
+        f"This role will be DM'd during Alpha (Level 3) threats.",
+        ephemeral=True
+    )
 # ============= LOGS COMMAND =============
 
 @bot.tree.command(name="test_db", description="Test database - shows partnership count")

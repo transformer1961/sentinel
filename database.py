@@ -135,6 +135,19 @@ async def init_database():
                 )
             ''')
             
+            # Threat levels table
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS threat_levels (
+                    id SERIAL PRIMARY KEY,
+                    server_id BIGINT,
+                    threat_level INTEGER DEFAULT 0,
+                    reason TEXT,
+                    set_by BIGINT,
+                    set_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (server_id) REFERENCES servers(server_id)
+                )
+            ''')
+            
             print("✅ PostgreSQL database initialized successfully")
     else:
         async with aiosqlite.connect(DATABASE_PATH) as db:
@@ -239,6 +252,19 @@ async def init_database():
                     backup_data TEXT,
                     backup_type TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (server_id) REFERENCES servers(server_id)
+                )
+            ''')
+            
+            # Threat levels table
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS threat_levels (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    server_id INTEGER,
+                    threat_level INTEGER DEFAULT 0,
+                    reason TEXT,
+                    set_by INTEGER,
+                    set_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (server_id) REFERENCES servers(server_id)
                 )
             ''')
@@ -718,4 +744,143 @@ async def get_partnerships_by_status(server_id, status):
                 (server_id, status)
             ) as cursor:
                 rows = await cursor.fetchall()
+                result = [dict(row) for row in rows]
+                print(f"DEBUG DB: Query returned {len(result)} rows for server {server_id}, status {status}")
+                return result
+
+async def delete_partnership(partnership_id):
+    """Delete a partnership"""
+    if USE_POSTGRES:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute('DELETE FROM partnerships WHERE id = $1', partnership_id)
+    else:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute('DELETE FROM partnerships WHERE id = ?', (partnership_id,))
+            await db.commit()
+
+# Threat Level Functions
+async def set_threat_level(server_id, level, reason, set_by):
+    """Set threat level for a server"""
+    if USE_POSTGRES:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                '''INSERT INTO threat_levels (server_id, threat_level, reason, set_by)
+                   VALUES ($1, $2, $3, $4)''',
+                server_id, level, reason, set_by
+            )
+            # Update current threat level in servers table
+            await conn.execute(
+                '''INSERT INTO servers (server_id) VALUES ($1)
+                   ON CONFLICT(server_id) DO NOTHING''',
+                server_id
+            )
+    else:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                '''INSERT INTO threat_levels (server_id, threat_level, reason, set_by)
+                   VALUES (?, ?, ?, ?)''',
+                (server_id, level, reason, set_by)
+            )
+            await db.commit()
+
+async def get_current_threat_level(server_id):
+    """Get current threat level"""
+    if USE_POSTGRES:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                '''SELECT * FROM threat_levels 
+                   WHERE server_id = $1 
+                   ORDER BY set_at DESC 
+                   LIMIT 1''',
+                server_id
+            )
+            if row:
+                return dict(row)
+            return {'threat_level': 0, 'reason': 'Default', 'set_by': None}
+    else:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                '''SELECT * FROM threat_levels 
+                   WHERE server_id = ? 
+                   ORDER BY set_at DESC 
+                   LIMIT 1''',
+                (server_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return dict(row)
+                return {'threat_level': 0, 'reason': 'Default', 'set_by': None}
+
+async def get_threat_history(server_id, limit=10):
+    """Get threat level history"""
+    if USE_POSTGRES:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                '''SELECT * FROM threat_levels 
+                   WHERE server_id = $1 
+                   ORDER BY set_at DESC 
+                   LIMIT $2''',
+                server_id, limit
+            )
+            return [dict(row) for row in rows]
+    else:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                '''SELECT * FROM threat_levels 
+                   WHERE server_id = ? 
+                   ORDER BY set_at DESC 
+                   LIMIT ?''',
+                (server_id, limit)
+            ) as cursor:
+                rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
+            
+async def add_threat_columns():
+    """Add missing columns for threat system"""
+    if USE_POSTGRES:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            try:
+                await conn.execute("ALTER TABLE servers ADD COLUMN onduty_role_id BIGINT")
+                print("✅ Added onduty_role_id column")
+            except Exception as e:
+                print(f"⚠️ onduty_role_id: {e}")
+            
+            try:
+                await conn.execute("ALTER TABLE servers ADD COLUMN allstaff_role_id BIGINT")
+                print("✅ Added allstaff_role_id column")
+            except Exception as e:
+                print(f"⚠️ allstaff_role_id: {e}")
+            
+            try:
+                await conn.execute("ALTER TABLE servers ADD COLUMN partnership_channel_id BIGINT")
+                print("✅ Added partnership_channel_id column")
+            except Exception as e:
+                print(f"⚠️ partnership_channel_id: {e}")
+    else:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            try:
+                await db.execute("ALTER TABLE servers ADD COLUMN onduty_role_id INTEGER")
+                print("✅ Added onduty_role_id column")
+            except Exception as e:
+                print(f"⚠️ onduty_role_id: {e}")
+            
+            try:
+                await db.execute("ALTER TABLE servers ADD COLUMN allstaff_role_id INTEGER")
+                print("✅ Added allstaff_role_id column")
+            except Exception as e:
+                print(f"⚠️ allstaff_role_id: {e}")
+            
+            try:
+                await db.execute("ALTER TABLE servers ADD COLUMN partnership_channel_id INTEGER")
+                print("✅ Added partnership_channel_id column")
+            except Exception as e:
+                print(f"⚠️ partnership_channel_id: {e}")
+            
+            await db.commit()
