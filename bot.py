@@ -2144,19 +2144,26 @@ async def role_requests(interaction: discord.Interaction):
         user = bot.get_user(request['user_id'])
         role = interaction.guild.get_role(request['role_id'])
         
+        # FIX: Use variables instead of nested f-strings with brackets
+        user_id = request['user_id']
+        role_id = request['role_id']
+        user_str = user.mention if user else f"ID: {user_id}"
+        role_str = role.mention if role else f"ID: {role_id}"
+        reason = request.get('reason', 'No reason provided')
+        
         embed.add_field(
             name=f"Request ID: {request['id']}",
             value=(
-                f"**User:** {user.mention if user else f'ID: {request['user_id']}'}\n"
-                f"**Role:** {role.mention if role else f'ID: {request['role_id']}'}\n"
-                f"**Reason:** {request.get('reason', 'No reason provided')}"
+                f"**User:** {user_str}\n"
+                f"**Role:** {role_str}\n"
+                f"**Reason:** {reason}"
             ),
             inline=False
         )
     
     embed.set_footer(text=f"Showing {min(10, len(pending_requests))} of {len(pending_requests)} requests")
     await interaction.followup.send(embed=embed, ephemeral=True)
-
+    
 # ============= LOG CHANNEL SETUP =============
 
 @bot.tree.command(name="set_log_channel", description="Set the security log channel")
