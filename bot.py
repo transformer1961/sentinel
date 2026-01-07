@@ -195,8 +195,8 @@ This is an automated message from Sentinel Security Bot.
             <p><strong>Server:</strong> {guild.name}</p>
             <p><strong>Time:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
             <hr>
-            <p>{message.replace('\n', '<br>')}</p>
-            {f'<p><strong>User:</strong> {user.name} ({user.id})</p>' if user else '<p><strong>System Alert</strong></p>'}
+            <p>{message.replace(chr(10), '<br>')}</p>
+            <p><strong>User:</strong> {user.name if user else 'System Alert'} {f'({user.id})' if user else ''}</p>
             <hr>
             <p style="color: #7f8c8d; font-size: 12px;">
                 This is an automated message from Sentinel Security Bot.<br>
