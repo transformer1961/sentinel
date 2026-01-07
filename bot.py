@@ -7,84 +7,114 @@ import asyncio
 from datetime import datetime, timedelta
 from collections import defaultdict
 import json
-import database as db
+import logging
+import aiohttp
 import random
 import string
-import aiohttp
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
-# Load environment variables
+# Import custom database module
+import database as db
+
+# ============= LOGGING SETUP =============
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('SecurityBot')
+
+# ============= CONFIGURATION =============
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
+SENTINEL_EMAIL = os.getenv('SENTINEL_EMAIL')
+SENTINEL_EMAIL_PASS = os.getenv('SENTINEL_EMAIL_PASS')
 
-# Bot setup with all required intents
+# Bot setup with required intents
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# In-memory tracking for actions
-action_tracker = defaultdict(lambda: defaultdict(list))
+# ============= CONSTANTS =============
+MAX_PARTNERSHIPS_DISPLAY = 10
+VERIFICATION_CODE_LENGTH = 8
+VERIFICATION_TIMEOUT = 300  # 5 minutes
 
-# Default thresholds
+# Default security thresholds (configurable per server)
 DEFAULT_THRESHOLDS = {
     'channel_delete': {'count': 3, 'seconds': 10},
-    'channel_create': {'count': 3, 'seconds': 10},
+    'channel_create': {'count': 5, 'seconds': 10},
     'role_delete': {'count': 3, 'seconds': 10},
-    'role_update': {'count': 5, 'seconds': 10},
+    'role_update': {'count': 10, 'seconds': 30},
     'member_ban': {'count': 5, 'seconds': 30},
     'member_kick': {'count': 5, 'seconds': 30},
-    'mass_join': {'count': 10, 'seconds': 60}
+    'mass_join': {'count': 10, 'seconds': 60},
+    'message_delete': {'count': 10, 'seconds': 5}
 }
 
-# Server configurations (loaded from database)
+# Threat level definitions
+THREAT_LEVELS = {
+    0: {"name": "🟢 Clear", "color": discord.Color.green(), "description": "Normal operations"},
+    1: {"name": "🟡 Elevated", "color": discord.Color.gold(), "description": "Minor threat detected"},
+    2: {"name": "🟠 High", "color": discord.Color.orange(), "description": "Serious threat - Lockdown engaged"},
+    3: {"name": "🔴 Alpha", "color": discord.Color.red(), "description": "FULL SECURITY BREACH"}
+}
+
+# ============= IN-MEMORY STORAGE =============
 server_configs = {}
 whitelists = defaultdict(set)
+action_tracker = defaultdict(lambda: defaultdict(list))
+join_tracker = defaultdict(list)
 
-@bot.event
-async def on_ready():
-    print(f'{bot.user} has connected to Discord!')
-    print(f'Bot is in {len(bot.guilds)} servers')
-    print(f'Bot ID: {bot.user.id}')
-    print(f'Intents: {bot.intents}')
-    print(f'Intents Value: {bot.intents.value}')
+# ============= EMAIL FUNCTIONS =============
+
+async def send_sentinel_mail(to: str, subject: str, text: str, html: str = None):
+    """Send email notification from Sentinel Security Bot"""
+    if not SENTINEL_EMAIL or not SENTINEL_EMAIL_PASS:
+        logger.warning("Email credentials not configured. Skipping email notification.")
+        return False
     
-    # Initialize database
-    await db.init_database()
-    
-    # Load configs and whitelists from database
-    global server_configs, whitelists
-    server_configs = await db.load_all_configs()
-    whitelists = await db.load_all_whitelists()
-    print(f'✅ Loaded {len(server_configs)} server configs and {len(whitelists)} whitelists')
-    
-    # Sync slash commands
     try:
-        synced = await bot.tree.sync()
-        print(f'Synced {len(synced)} command(s)')
+        msg = MIMEMultipart('alternative')
+        msg['From'] = f"Sentinel Security Bot <{SENTINEL_EMAIL}>"
+        msg['To'] = to
+        msg['Subject'] = subject
+        
+        text_part = MIMEText(text, 'plain')
+        msg.attach(text_part)
+        
+        if html:
+            html_part = MIMEText(html, 'html')
+            msg.attach(html_part)
+        
+        await asyncio.to_thread(_send_email_sync, msg, to)
+        logger.info(f"Email sent successfully to {to}")
+        return True
+        
     except Exception as e:
-        print(f'Error syncing commands: {e}')
-    
-    print('\n🔍 DEBUG MODE: Bot is now monitoring events...')
+        logger.error(f"Failed to send email to {to}: {e}")
+        return False
 
-# Test event to see if bot receives ANY events
-@bot.event
-async def on_message(message):
-    if message.author == bot.user:
-        return
-    print(f'💬 DEBUG: Message received from {message.author.name}: {message.content[:50]}')
+def _send_email_sync(msg, to):
+    """Synchronous email sending (run in thread)"""
+    with smtplib.SMTP('smtp.gmail.com', 587) as server:
+        server.starttls()
+        server.login(SENTINEL_EMAIL, SENTINEL_EMAIL_PASS)
+        server.send_message(msg)
 
-# Helper function to check if user is whitelisted
-async def is_whitelisted_check(guild_id, user_id):
-    # Check in-memory first
+# ============= HELPER FUNCTIONS =============
+
+async def is_whitelisted(guild_id: int, user_id: int) -> bool:
+    """Check if user is whitelisted"""
     if user_id in whitelists.get(guild_id, set()):
         return True
-    # Fallback to database
     return await db.is_whitelisted(guild_id, user_id)
 
-# Helper function to track actions
-def track_action(guild_id, user_id, action_type):
+def track_action(guild_id: int, user_id: int, action_type: str) -> int:
+    """Track user actions and return count within threshold window"""
     now = datetime.now()
     action_tracker[guild_id][(user_id, action_type)].append(now)
     
-    # Clean old entries
     threshold = DEFAULT_THRESHOLDS.get(action_type, {'seconds': 60})
     cutoff = now - timedelta(seconds=threshold['seconds'])
     action_tracker[guild_id][(user_id, action_type)] = [
@@ -93,45 +123,129 @@ def track_action(guild_id, user_id, action_type):
     
     return len(action_tracker[guild_id][(user_id, action_type)])
 
-# Helper function to send alerts
-async def send_alert(guild, message, user=None):
+async def send_alert(guild: discord.Guild, message: str, user: discord.User = None, 
+                     color: discord.Color = discord.Color.red(), email_admins: bool = False):
+    """Send security alert to log channel, whitelisted admins, and optionally email"""
     config = server_configs.get(guild.id, {})
     log_channel_id = config.get('log_channel_id')
     
     embed = discord.Embed(
         title="🚨 Security Alert",
         description=message,
-        color=discord.Color.red(),
+        color=color,
         timestamp=datetime.now()
     )
     
     if user:
         embed.add_field(name="User", value=f"{user.mention} ({user.id})", inline=False)
     
-    # Log to database
+    embed.add_field(name="Server", value=guild.name, inline=True)
+    embed.add_field(name="Time", value=datetime.now().strftime('%Y-%m-%d %H:%M:%S'), inline=True)
+    
     await db.add_log(
-        guild.id, 
-        'security_alert', 
+        guild.id,
+        'security_alert',
         user.id if user else None,
         details={'message': message}
     )
     
-    # Send to log channel
     if log_channel_id:
         channel = guild.get_channel(log_channel_id)
         if channel:
-            await channel.send(embed=embed)
+            try:
+                await channel.send(embed=embed)
+            except Exception as e:
+                logger.error(f"Failed to send alert to log channel: {e}")
     
-    # DM whitelisted admins
+    admin_emails = []
     for member in guild.members:
-        if member.guild_permissions.administrator and await is_whitelisted_check(guild.id, member.id):
+        if member.guild_permissions.administrator and await is_whitelisted(guild.id, member.id):
             try:
                 await member.send(embed=embed)
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"Could not DM {member.name}: {e}")
+            
+            if email_admins:
+                admin_email = await db.get_user_email(guild.id, member.id)
+                if admin_email:
+                    admin_emails.append(admin_email)
+    
+    if email_admins and admin_emails:
+        email_subject = f"🚨 Security Alert: {guild.name}"
+        email_text = f"""
+Sentinel Security Bot Alert
 
-# Helper function to quarantine user
-async def quarantine_user(guild, user, reason):
+Server: {guild.name}
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+{message}
+
+{'User: ' + user.name + ' (' + str(user.id) + ')' if user else 'System Alert'}
+
+Please check your Discord server immediately.
+
+---
+This is an automated message from Sentinel Security Bot.
+        """
+        
+        email_html = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; padding: 20px;">
+            <h2 style="color: #e74c3c;">🚨 Security Alert</h2>
+            <p><strong>Server:</strong> {guild.name}</p>
+            <p><strong>Time:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+            <hr>
+            <p>{message.replace('\n', '<br>')}</p>
+            {f'<p><strong>User:</strong> {user.name} ({user.id})</p>' if user else '<p><strong>System Alert</strong></p>'}
+            <hr>
+            <p style="color: #7f8c8d; font-size: 12px;">
+                This is an automated message from Sentinel Security Bot.<br>
+                Please check your Discord server immediately.
+            </p>
+        </body>
+        </html>
+        """
+        
+        for email in admin_emails:
+            await send_sentinel_mail(email, email_subject, email_text, email_html)
+
+async def log_action(guild: discord.Guild, category: str, title: str, user: discord.User, 
+                     description: str, extra_info: dict = None):
+    """Log an action to the log channel and database"""
+    config = server_configs.get(guild.id, {})
+    log_channel_id = config.get('log_channel_id')
+    
+    embed = discord.Embed(
+        title=f"📋 {title}",
+        description=description,
+        color=discord.Color.blue(),
+        timestamp=datetime.now()
+    )
+    
+    embed.add_field(name="Category", value=category.title(), inline=True)
+    embed.add_field(name="User", value=user.mention if user else "System", inline=True)
+    
+    if extra_info:
+        for key, value in extra_info.items():
+            embed.add_field(name=key, value=str(value), inline=True)
+    
+    await db.add_log(
+        guild.id,
+        category,
+        user.id if user else None,
+        details={'title': title, 'description': description, **(extra_info or {})}
+    )
+    
+    if log_channel_id:
+        channel = guild.get_channel(log_channel_id)
+        if channel:
+            try:
+                await channel.send(embed=embed)
+            except Exception as e:
+                logger.error(f"Failed to send log: {e}")
+
+async def quarantine_user(guild: discord.Guild, user: discord.User, reason: str) -> bool:
+    """Quarantine a user by removing all roles and adding quarantine role"""
     config = server_configs.get(guild.id, {})
     quarantine_role_id = config.get('quarantine_role_id')
     
@@ -148,154 +262,313 @@ async def quarantine_user(guild, user, reason):
     if not member:
         return False
     
-    # Remove all roles and add quarantine role
     try:
-        roles_removed = [role for role in member.roles if role != guild.default_role]
-        await member.remove_roles(*roles_removed, reason=f"Quarantined: {reason}")
+        removed_roles = [role.id for role in member.roles if role != guild.default_role]
+        await db.store_quarantine_roles(guild.id, user.id, removed_roles)
+        
+        roles_to_remove = [role for role in member.roles if role != guild.default_role]
+        if roles_to_remove:
+            await member.remove_roles(*roles_to_remove, reason=f"Quarantined: {reason}")
+        
         await member.add_roles(quarantine_role, reason=f"Quarantined: {reason}")
         
-        await send_alert(guild, f"✅ Quarantined {user.mention}\nReason: {reason}", user)
+        await send_alert(guild, f"✅ Quarantined {user.mention}\nReason: {reason}", user, email_admins=True)
+        
+        try:
+            await member.send(
+                f"⚠️ You have been quarantined in **{guild.name}**\n"
+                f"**Reason:** {reason}\n"
+                f"Please contact a server administrator for assistance."
+            )
+        except:
+            pass
+        
         return True
     except Exception as e:
+        logger.error(f"Failed to quarantine user {user.id}: {e}")
         await send_alert(guild, f"❌ Failed to quarantine {user.mention}: {str(e)}", user)
         return False
 
-# Event: Channel Deletion
+def generate_verification_code():
+    """Generate a random verification code"""
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=VERIFICATION_CODE_LENGTH))
+
+async def get_roblox_user_info(username: str):
+    """Get Roblox user info from username"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                'https://users.roblox.com/v1/usernames/users',
+                json={'usernames': [username], 'excludeBannedUsers': True}
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get('data') and len(data['data']) > 0:
+                        user_data = data['data'][0]
+                        user_id = user_data['id']
+                        
+                        async with session.get(f'https://users.roblox.com/v1/users/{user_id}') as profile_resp:
+                            if profile_resp.status == 200:
+                                profile_data = await profile_resp.json()
+                                return {
+                                    'id': user_id,
+                                    'username': user_data['name'],
+                                    'displayName': user_data['displayName'],
+                                    'description': profile_data.get('description', '')
+                                }
+        return None
+    except Exception as e:
+        logger.error(f'Error fetching Roblox user: {e}')
+        return None
+
+# ============= BOT EVENTS =============
+
+@bot.event
+async def on_ready():
+    logger.info(f'{bot.user} has connected to Discord!')
+    logger.info(f'Bot is in {len(bot.guilds)} servers')
+    logger.info(f'Bot ID: {bot.user.id}')
+    
+    await db.init_database()
+    
+    global server_configs, whitelists
+    server_configs = await db.load_all_configs()
+    whitelists = await db.load_all_whitelists()
+    logger.info(f'✅ Loaded {len(server_configs)} server configs and {len(whitelists)} whitelists')
+    
+    bot.add_view(VerificationView())
+    bot.add_view(RobloxVerificationView())
+    
+    try:
+        synced = await bot.tree.sync()
+        logger.info(f'Synced {len(synced)} command(s)')
+    except Exception as e:
+        logger.error(f'Error syncing commands: {e}')
+    
+    logger.info('🔍 Bot is now monitoring events...')
+
 @bot.event
 async def on_guild_channel_delete(channel):
-    print(f'\n🗑️ DEBUG: Channel deleted: {channel.name} in {channel.guild.name}')
-    await asyncio.sleep(1)  # Wait for audit log
-    
-    guild = channel.guild
-    print(f'🔍 DEBUG: Checking audit logs...')
-    
-    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_delete):
-        print(f'📋 DEBUG: Audit log entry found - User: {entry.user.name}, Target: {entry.target.id}')
-        if entry.target.id == channel.id:
-            user = entry.user
-            
-            print(f'👤 DEBUG: Deleter: {user.name} (ID: {user.id})')
-            print(f'🤖 DEBUG: Is bot? {user.bot}')
-            print(f'✅ DEBUG: Is whitelisted? {is_whitelisted(guild.id, user.id)}')
-            
-            # Skip if whitelisted or bot
-            if user.bot or await is_whitelisted_check(guild.id, user.id):
-                print(f'⏭️ DEBUG: Skipping (bot or whitelisted)')
-                return
-            
-            # Track action
-            count = track_action(guild.id, user.id, 'channel_delete')
-            threshold = DEFAULT_THRESHOLDS['channel_delete']
-            
-            print(f'📊 DEBUG: Delete count: {count}/{threshold["count"]} in {threshold["seconds"]}s')
-            
-            if count >= threshold['count']:
-                print(f'🚨 DEBUG: THRESHOLD BREACHED! Sending alert and quarantining...')
-                await send_alert(guild, 
-                    f"⚠️ **CHANNEL DELETE THRESHOLD BREACHED**\n"
-                    f"{user.mention} deleted {count} channels in {threshold['seconds']} seconds!",
-                    user)
-                await quarantine_user(guild, user, f"Mass channel deletion ({count} channels)")
-            else:
-                print(f'✓ DEBUG: Below threshold, continuing to monitor')
-        else:
-            print(f'⚠️ DEBUG: Audit log target mismatch')
-
-# Event: Channel Creation
-@bot.event
-async def on_guild_channel_create(channel):
-    print(f'\n➕ DEBUG: Channel created: {channel.name} in {channel.guild.name}')
+    """Monitor channel deletions"""
     await asyncio.sleep(1)
     
     guild = channel.guild
-    print(f'🔍 DEBUG: Checking audit logs...')
     
-    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_create):
-        print(f'📋 DEBUG: Audit log entry found - User: {entry.user.name}, Target: {entry.target.id}')
-        if entry.target.id == channel.id:
-            user = entry.user
-            
-            print(f'👤 DEBUG: Creator: {user.name} (ID: {user.id})')
-            print(f'🤖 DEBUG: Is bot? {user.bot}')
-            print(f'✅ DEBUG: Is whitelisted? {await is_whitelisted_check(guild.id, user.id)}')
-            
-            if user.bot or await is_whitelisted_check(guild.id, user.id):
-                print(f'⏭️ DEBUG: Skipping (bot or whitelisted)')
-                return
-            
-            count = track_action(guild.id, user.id, 'channel_create')
-            threshold = DEFAULT_THRESHOLDS['channel_create']
-            
-            print(f'📊 DEBUG: Create count: {count}/{threshold["count"]} in {threshold["seconds"]}s')
-            
-            if count >= threshold['count']:
-                print(f'🚨 DEBUG: THRESHOLD BREACHED! Sending alert and quarantining...')
-                await send_alert(guild,
-                    f"⚠️ **CHANNEL CREATE THRESHOLD BREACHED**\n"
-                    f"{user.mention} created {count} channels in {threshold['seconds']} seconds!",
-                    user)
-                await quarantine_user(guild, user, f"Mass channel creation ({count} channels)")
-            else:
-                print(f'✓ DEBUG: Below threshold, continuing to monitor')
-        else:
-            print(f'⚠️ DEBUG: Audit log target mismatch')
+    try:
+        async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_delete):
+            if entry.target.id == channel.id:
+                user = entry.user
+                
+                if user.bot or await is_whitelisted(guild.id, user.id):
+                    return
+                
+                count = track_action(guild.id, user.id, 'channel_delete')
+                threshold = DEFAULT_THRESHOLDS['channel_delete']
+                
+                logger.info(f"Channel deleted by {user.name}: {count}/{threshold['count']}")
+                
+                if count >= threshold['count']:
+                    await send_alert(guild,
+                        f"⚠️ **CHANNEL DELETE THRESHOLD BREACHED**\n"
+                        f"{user.mention} deleted {count} channels in {threshold['seconds']} seconds!",
+                        user,
+                        email_admins=True)
+                    await quarantine_user(guild, user, f"Mass channel deletion ({count} channels)")
+    except Exception as e:
+        logger.error(f"Error in on_guild_channel_delete: {e}")
 
-# Event: Role Deletion
+@bot.event
+async def on_guild_channel_create(channel):
+    """Monitor channel creations"""
+    await asyncio.sleep(1)
+    
+    guild = channel.guild
+    
+    try:
+        async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_create):
+            if entry.target.id == channel.id:
+                user = entry.user
+                
+                if user.bot or await is_whitelisted(guild.id, user.id):
+                    return
+                
+                count = track_action(guild.id, user.id, 'channel_create')
+                threshold = DEFAULT_THRESHOLDS['channel_create']
+                
+                logger.info(f"Channel created by {user.name}: {count}/{threshold['count']}")
+                
+                if count >= threshold['count']:
+                    await send_alert(guild,
+                        f"⚠️ **CHANNEL CREATE THRESHOLD BREACHED**\n"
+                        f"{user.mention} created {count} channels in {threshold['seconds']} seconds!",
+                        user,
+                        email_admins=True)
+                    await quarantine_user(guild, user, f"Mass channel creation ({count} channels)")
+    except Exception as e:
+        logger.error(f"Error in on_guild_channel_create: {e}")
+
 @bot.event
 async def on_guild_role_delete(role):
+    """Monitor role deletions"""
     await asyncio.sleep(1)
     
     guild = role.guild
-    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.role_delete):
-        if entry.target.id == role.id:
-            user = entry.user
-            
-            if user.bot or await is_whitelisted_check(guild.id, user.id):
-                return
-            
-            count = track_action(guild.id, user.id, 'role_delete')
-            threshold = DEFAULT_THRESHOLDS['role_delete']
-            
-            if count >= threshold['count']:
-                await send_alert(guild,
-                    f"⚠️ **ROLE DELETE THRESHOLD BREACHED**\n"
-                    f"{user.mention} deleted {count} roles in {threshold['seconds']} seconds!",
-                    user)
-                await quarantine_user(guild, user, f"Mass role deletion ({count} roles)")
+    
+    try:
+        async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.role_delete):
+            if entry.target.id == role.id:
+                user = entry.user
+                
+                if user.bot or await is_whitelisted(guild.id, user.id):
+                    return
+                
+                count = track_action(guild.id, user.id, 'role_delete')
+                threshold = DEFAULT_THRESHOLDS['role_delete']
+                
+                if count >= threshold['count']:
+                    await send_alert(guild,
+                        f"⚠️ **ROLE DELETE THRESHOLD BREACHED**\n"
+                        f"{user.mention} deleted {count} roles in {threshold['seconds']} seconds!",
+                        user,
+                        email_admins=True)
+                    await quarantine_user(guild, user, f"Mass role deletion ({count} roles)")
+    except Exception as e:
+        logger.error(f"Error in on_guild_role_delete: {e}")
 
-# Event: Member Ban
 @bot.event
-async def on_member_ban(guild, user):
+async def on_guild_role_update(role_before, role_after):
+    """Monitor role updates (especially permission changes)"""
     await asyncio.sleep(1)
     
-    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.ban):
-        if entry.target.id == user.id:
-            banner = entry.user
-            
-            if banner.bot or await is_whitelisted_check(guild.id, banner.id):
-                return
-            
-            count = track_action(guild.id, banner.id, 'member_ban')
-            threshold = DEFAULT_THRESHOLDS['member_ban']
-            
-            if count >= threshold['count']:
-                await send_alert(guild,
-                    f"⚠️ **MASS BAN THRESHOLD BREACHED**\n"
-                    f"{banner.mention} banned {count} members in {threshold['seconds']} seconds!",
-                    banner)
-                await quarantine_user(guild, banner, f"Mass member banning ({count} bans)")
+    guild = role_after.guild
+    
+    try:
+        dangerous_perms = [
+            'administrator', 'manage_guild', 'manage_roles', 
+            'manage_channels', 'ban_members', 'kick_members'
+        ]
+        
+        perms_added = []
+        for perm in dangerous_perms:
+            if not getattr(role_before.permissions, perm) and getattr(role_after.permissions, perm):
+                perms_added.append(perm)
+        
+        if perms_added:
+            async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.role_update):
+                if entry.target.id == role_after.id:
+                    user = entry.user
+                    
+                    if user.bot or await is_whitelisted(guild.id, user.id):
+                        return
+                    
+                    count = track_action(guild.id, user.id, 'role_update')
+                    threshold = DEFAULT_THRESHOLDS['role_update']
+                    
+                    logger.warning(f"Dangerous permissions added to role {role_after.name} by {user.name}")
+                    
+                    if count >= threshold['count']:
+                        await send_alert(guild,
+                            f"⚠️ **SUSPICIOUS ROLE MODIFICATIONS**\n"
+                            f"{user.mention} modified {count} roles in {threshold['seconds']} seconds!\n"
+                            f"Dangerous permissions added: {', '.join(perms_added)}",
+                            user,
+                            color=discord.Color.orange(),
+                            email_admins=True)
+    except Exception as e:
+        logger.error(f"Error in on_guild_role_update: {e}")
 
-# Event: Mass Join Detection
-join_tracker = defaultdict(list)
+@bot.event
+async def on_member_ban(guild, user):
+    """Monitor member bans"""
+    await asyncio.sleep(1)
+    
+    try:
+        async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.ban):
+            if entry.target.id == user.id:
+                banner = entry.user
+                
+                if banner.bot or await is_whitelisted(guild.id, banner.id):
+                    return
+                
+                count = track_action(guild.id, banner.id, 'member_ban')
+                threshold = DEFAULT_THRESHOLDS['member_ban']
+                
+                if count >= threshold['count']:
+                    await send_alert(guild,
+                        f"⚠️ **MASS BAN THRESHOLD BREACHED**\n"
+                        f"{banner.mention} banned {count} members in {threshold['seconds']} seconds!",
+                        banner,
+                        email_admins=True)
+                    await quarantine_user(guild, banner, f"Mass member banning ({count} bans)")
+    except Exception as e:
+        logger.error(f"Error in on_member_ban: {e}")
+
+@bot.event
+async def on_member_remove(member):
+    """Monitor member kicks/leaves"""
+    await asyncio.sleep(1)
+    
+    guild = member.guild
+    
+    try:
+        async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.kick):
+            if entry.target.id == member.id:
+                kicker = entry.user
+                
+                if kicker.bot or await is_whitelisted(guild.id, kicker.id):
+                    return
+                
+                count = track_action(guild.id, kicker.id, 'member_kick')
+                threshold = DEFAULT_THRESHOLDS['member_kick']
+                
+                if count >= threshold['count']:
+                    await send_alert(guild,
+                        f"⚠️ **MASS KICK THRESHOLD BREACHED**\n"
+                        f"{kicker.mention} kicked {count} members in {threshold['seconds']} seconds!",
+                        kicker,
+                        email_admins=True)
+                    await quarantine_user(guild, kicker, f"Mass member kicking ({count} kicks)")
+                return
+    except Exception as e:
+        logger.error(f"Error checking for kick: {e}")
+    
+    await db.add_log(
+        guild.id,
+        'member_leave',
+        member.id,
+        details={'member_name': member.name, 'member_id': member.id}
+    )
 
 @bot.event
 async def on_member_join(member):
+    """Handle new member joins - verification and raid detection"""
     guild = member.guild
-    now = datetime.now()
+    config = server_configs.get(guild.id, {})
     
+    if config.get('verification_enabled'):
+        unverified_role_id = config.get('unverified_role_id')
+        if unverified_role_id:
+            unverified_role = guild.get_role(unverified_role_id)
+            if unverified_role:
+                try:
+                    await member.add_roles(unverified_role, reason="New member - needs verification")
+                    
+                    verification_channel_id = config.get('verification_channel_id')
+                    if verification_channel_id:
+                        channel = guild.get_channel(verification_channel_id)
+                        try:
+                            await member.send(
+                                f"Welcome to **{guild.name}**! 🎉\n\n"
+                                f"Please verify yourself in {channel.mention} to gain access to the server."
+                            )
+                        except:
+                            pass
+                except Exception as e:
+                    logger.error(f"Failed to apply unverified role to {member.id}: {e}")
+    
+    now = datetime.now()
     join_tracker[guild.id].append(now)
     
-    # Clean old entries
     cutoff = now - timedelta(seconds=DEFAULT_THRESHOLDS['mass_join']['seconds'])
     join_tracker[guild.id] = [t for t in join_tracker[guild.id] if t > cutoff]
     
@@ -306,14 +579,142 @@ async def on_member_join(member):
         await send_alert(guild,
             f"⚠️ **POSSIBLE RAID DETECTED**\n"
             f"{count} accounts joined in {threshold['seconds']} seconds!\n"
-            f"Consider enabling verification or lockdown.")
+            f"Consider enabling verification or lockdown.",
+            color=discord.Color.orange(),
+            email_admins=True)
+        
+        await db.add_log(
+            guild.id,
+            'mass_join_detected',
+            None,
+            details={'count': count, 'time_window': threshold['seconds']}
+        )
 
+@bot.event
+async def on_message_delete(message):
+    """Monitor mass message deletions"""
+    if message.author.bot:
+        return
+    
+    guild = message.guild
+    if not guild:
+        return
+    
+    await asyncio.sleep(1)
+    
+    try:
+        async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.message_delete):
+            if entry.target.id == message.author.id:
+                deleter = entry.user
+                
+                if deleter.bot or await is_whitelisted(guild.id, deleter.id):
+                    return
+                
+                count = track_action(guild.id, deleter.id, 'message_delete')
+                threshold = DEFAULT_THRESHOLDS['message_delete']
+                
+                if count >= threshold['count']:
+                    await send_alert(guild,
+                        f"⚠️ **MASS MESSAGE DELETE DETECTED**\n"
+                        f"{deleter.mention} deleted {count} messages in {threshold['seconds']} seconds!",
+                        deleter,
+                        color=discord.Color.orange())
+    except Exception as e:
+        logger.error(f"Error in on_message_delete: {e}")
 
-# Setup Command
+@bot.event
+async def on_bulk_message_delete(messages):
+    """Monitor bulk message deletions (purges)"""
+    if not messages:
+        return
+    
+    guild = messages[0].guild
+    if not guild:
+        return
+    
+    await asyncio.sleep(1)
+    
+    try:
+        async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.message_bulk_delete):
+            user = entry.user
+            
+            if user.bot or await is_whitelisted(guild.id, user.id):
+                return
+            
+            await send_alert(guild,
+                f"⚠️ **BULK MESSAGE DELETE DETECTED**\n"
+                f"{user.mention} deleted {len(messages)} messages in bulk!\n"
+                f"Channel: {messages[0].channel.mention}",
+                user,
+                color=discord.Color.orange())
+    except Exception as e:
+        logger.error(f"Error in on_bulk_message_delete: {e}")
+
+@bot.event
+async def on_guild_update(before, after):
+    """Monitor server settings changes"""
+    await asyncio.sleep(1)
+    
+    try:
+        critical_changes = []
+        
+        if before.name != after.name:
+            critical_changes.append(f"Server name changed: {before.name} → {after.name}")
+        
+        if before.icon != after.icon:
+            critical_changes.append("Server icon changed")
+        
+        if before.verification_level != after.verification_level:
+            critical_changes.append(f"Verification level: {before.verification_level} → {after.verification_level}")
+        
+        if critical_changes:
+            async for entry in after.audit_logs(limit=1, action=discord.AuditLogAction.guild_update):
+                user = entry.user
+                
+                if user.bot or await is_whitelisted(after.id, user.id):
+                    return
+                
+                await send_alert(after,
+                    f"⚠️ **SERVER SETTINGS MODIFIED**\n"
+                    f"{user.mention} made the following changes:\n" + "\n".join(f"• {change}" for change in critical_changes),
+                    user,
+                    color=discord.Color.blue())
+    except Exception as e:
+        logger.error(f"Error in on_guild_update: {e}")
+
+@bot.event
+async def on_webhooks_update(channel):
+    """Monitor webhook creations/modifications"""
+    await asyncio.sleep(1)
+    
+    guild = channel.guild
+    
+    try:
+        async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.webhook_create):
+            user = entry.user
+            
+            if user.bot or await is_whitelisted(guild.id, user.id):
+                return
+            
+            await send_alert(guild,
+                f"⚠️ **WEBHOOK CREATED**\n"
+                f"{user.mention} created a webhook in {channel.mention}\n"
+                f"Webhook: {entry.target.name if entry.target else 'Unknown'}",
+                user,
+                color=discord.Color.gold())
+    except Exception as e:
+        logger.error(f"Error in on_webhooks_update: {e}")
+
+# ============= SETUP COMMANDS =============
+
+# FIXES FOR bot.py - Add these to replace existing commands
+
+# ============= FIX 1: SETUP COMMAND =============
+
 @bot.tree.command(name="setup", description="Initial bot setup wizard")
 @app_commands.checks.has_permissions(administrator=True)
 async def setup(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=True)  # ADD THIS LINE
     
     embed = discord.Embed(
         title="🛡️ Security Bot Setup",
@@ -323,40 +724,49 @@ async def setup(interaction: discord.Interaction):
     
     embed.add_field(
         name="Step 1: Set Log Channel",
-        value="Use `/set_log_channel #channel` to set where alerts go",
+        value="`/set_log_channel #channel` - Where alerts are sent",
         inline=False
     )
     
     embed.add_field(
         name="Step 2: Create Quarantine Role",
-        value="Use `/create_quarantine_role` to create a quarantine role",
+        value="`/create_quarantine_role` - Role for restricted users",
         inline=False
     )
     
     embed.add_field(
         name="Step 3: Whitelist Trusted Users",
-        value="Use `/whitelist add @user` to whitelist admins/bots",
+        value="`/whitelist_add @user` - Exempt from monitoring",
         inline=False
     )
     
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="set_log_channel", description="Set the security log channel")
-@app_commands.checks.has_permissions(administrator=True)
-async def set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
-    await db.update_server_field(interaction.guild.id, 'log_channel_id', channel.id)
-    
-    # Update in-memory cache
-    if interaction.guild.id not in server_configs:
-        server_configs[interaction.guild.id] = {}
-    server_configs[interaction.guild.id]['log_channel_id'] = channel.id
-    
-    await interaction.response.send_message(
-        f"✅ Security log channel set to {channel.mention}",
-        ephemeral=True
+    embed.add_field(
+        name="Optional: Email Notifications",
+        value="`/set_admin_email your@email.com` - Receive alerts via email",
+        inline=False
     )
+    
+    embed.add_field(
+        name="Optional: Verification",
+        value="`/setup_verification #channel` - New member verification\n`/setup_roblox_verification #channel` - Roblox account verification",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="Optional: Threat Roles",
+        value="`/set_onduty_role @role` - For elevated threats\n`/set_allstaff_role @role` - For Alpha threats",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="Optional: Partnership System",
+        value="`/set_partnership_channel #channel` - Server partnerships",
+        inline=False
+    )
+    
+    await interaction.followup.send(embed=embed, ephemeral=True)  # CHANGE THIS LINE
 
-# Create Quarantine Role
+
 @bot.tree.command(name="create_quarantine_role", description="Create a quarantine role")
 @app_commands.checks.has_permissions(administrator=True)
 async def create_quarantine_role(interaction: discord.Interaction):
@@ -364,7 +774,6 @@ async def create_quarantine_role(interaction: discord.Interaction):
     
     guild = interaction.guild
     
-    # Create role with no permissions
     role = await guild.create_role(
         name="Quarantined",
         color=discord.Color.dark_grey(),
@@ -372,9 +781,20 @@ async def create_quarantine_role(interaction: discord.Interaction):
         reason="Security bot quarantine role"
     )
     
+    for channel in guild.channels:
+        try:
+            await channel.set_permissions(role, 
+                read_messages=True if isinstance(channel, discord.TextChannel) else False,
+                send_messages=False,
+                add_reactions=False,
+                connect=False if isinstance(channel, discord.VoiceChannel) else None,
+                speak=False if isinstance(channel, discord.VoiceChannel) else None
+            )
+        except:
+            pass
+    
     await db.update_server_field(guild.id, 'quarantine_role_id', role.id)
     
-    # Update in-memory cache
     if guild.id not in server_configs:
         server_configs[guild.id] = {}
     server_configs[guild.id]['quarantine_role_id'] = role.id
@@ -385,19 +805,116 @@ async def create_quarantine_role(interaction: discord.Interaction):
         ephemeral=True
     )
 
-# Whitelist Commands
+@bot.tree.command(name="set_admin_email", description="Set your email for security alerts")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_admin_email(interaction: discord.Interaction, email: str):
+    """Set admin email for notifications"""
+    if '@' not in email or '.' not in email:
+        await interaction.response.send_message(
+            "❌ Invalid email format. Please provide a valid email address.",
+            ephemeral=True
+        )
+        return
+    
+    await db.set_user_email(interaction.guild.id, interaction.user.id, email)
+    
+    await interaction.response.send_message(
+        f"✅ Your email has been set to: `{email}`\n"
+        f"You will now receive critical security alerts via email.",
+        ephemeral=True
+    )
+    
+    try:
+        await send_sentinel_mail(
+            email,
+            f"✅ Sentinel Bot Email Configured: {interaction.guild.name}",
+            f"""
+Hello {interaction.user.name},
+
+Your email has been successfully configured to receive security alerts from Sentinel Security Bot.
+
+Server: {interaction.guild.name}
+Your Discord ID: {interaction.user.id}
+
+You will receive notifications for:
+- Critical security breaches
+- Mass actions (channel/role deletion, mass bans)
+- Threat level changes
+- Quarantine actions
+
+To disable email notifications, use /remove_admin_email
+
+---
+Sentinel Security Bot
+            """,
+            f"""
+            <html>
+            <body style="font-family: Arial, sans-serif; padding: 20px;">
+                <h2 style="color: #27ae60;">✅ Email Configured Successfully</h2>
+                <p>Hello <strong>{interaction.user.name}</strong>,</p>
+                <p>Your email has been successfully configured to receive security alerts from <strong>Sentinel Security Bot</strong>.</p>
+                
+                <hr>
+                <p><strong>Server:</strong> {interaction.guild.name}</p>
+                <p><strong>Your Discord ID:</strong> {interaction.user.id}</p>
+                
+                <h3>You will receive notifications for:</h3>
+                <ul>
+                    <li>Critical security breaches</li>
+                    <li>Mass actions (channel/role deletion, mass bans)</li>
+                    <li>Threat level changes</li>
+                    <li>Quarantine actions</li>
+                </ul>
+                
+                <p style="color: #7f8c8d; font-size: 12px;">
+                    To disable email notifications, use <code>/remove_admin_email</code>
+                </p>
+                
+                <hr>
+                <p style="color: #7f8c8d; font-size: 12px;">Sentinel Security Bot</p>
+            </body>
+            </html>
+            """
+        )
+    except Exception as e:
+        logger.error(f"Failed to send test email: {e}")
+
+@bot.tree.command(name="remove_admin_email", description="Remove your email from notifications")
+@app_commands.checks.has_permissions(administrator=True)
+async def remove_admin_email(interaction: discord.Interaction):
+    """Remove admin email"""
+    removed = await db.remove_user_email(interaction.guild.id, interaction.user.id)
+    
+    if removed:
+        await interaction.response.send_message(
+            "✅ Your email has been removed from notifications.",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "❌ No email found for your account.",
+            ephemeral=True
+        )
+
+# ============= WHITELIST COMMANDS =============
+
 @bot.tree.command(name="whitelist_add", description="Add user to whitelist")
 @app_commands.checks.has_permissions(administrator=True)
 async def whitelist_add(interaction: discord.Interaction, user: discord.User):
+    await interaction.response.defer(ephemeral=True)  # ADD THIS LINE
+    
     await db.add_to_whitelist(interaction.guild.id, user.id, 'user', interaction.user.id)
     
-    # Update in-memory cache
     if interaction.guild.id not in whitelists:
         whitelists[interaction.guild.id] = set()
     whitelists[interaction.guild.id].add(user.id)
     
-    await interaction.response.send_message(
-        f"✅ Added {user.mention} to whitelist",
+    await log_action(interaction.guild, 'whitelist', 'User Whitelisted',
+                    interaction.user, f"{user.mention} added to whitelist",
+                    extra_info={'Target User': user.name})
+    
+    await interaction.followup.send(  # CHANGE TO followup
+        f"✅ Added {user.mention} to whitelist - they are now exempt from security monitoring",
         ephemeral=True
     )
 
@@ -406,11 +923,14 @@ async def whitelist_add(interaction: discord.Interaction, user: discord.User):
 async def whitelist_remove(interaction: discord.Interaction, user: discord.User):
     removed = await db.remove_from_whitelist(interaction.guild.id, user.id)
     
-    # Update in-memory cache
     if user.id in whitelists.get(interaction.guild.id, set()):
         whitelists[interaction.guild.id].remove(user.id)
     
     if removed:
+        await log_action(interaction.guild, 'whitelist', 'User Removed from Whitelist',
+                        interaction.user, f"{user.mention} removed from whitelist",
+                        extra_info={'Target User': user.name})
+        
         await interaction.response.send_message(
             f"✅ Removed {user.mention} from whitelist",
             ephemeral=True
@@ -431,7 +951,8 @@ async def whitelist_list(interaction: discord.Interaction):
         return
     
     embed = discord.Embed(
-        title="Whitelisted Users",
+        title="✅ Whitelisted Users",
+        description="These users are exempt from security monitoring:",
         color=discord.Color.green()
     )
     
@@ -440,38 +961,13 @@ async def whitelist_list(interaction: discord.Interaction):
         user = bot.get_user(user_id)
         users.append(f"• {user.mention if user else f'User ID: {user_id}'}")
     
-    embed.description = "\n".join(users)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# Status Command
-@bot.tree.command(name="status", description="Show bot protection status")
-async def status(interaction: discord.Interaction):
-    config = server_configs.get(interaction.guild.id, {})
-    
-    embed = discord.Embed(
-        title="🛡️ Security Bot Status",
-        color=discord.Color.blue()
-    )
-    
-    log_channel = "✅ Configured" if config.get('log_channel_id') else "❌ Not Set"
-    quarantine_role = "✅ Configured" if config.get('quarantine_role_id') else "❌ Not Set"
-    whitelist_count = len(whitelists.get(interaction.guild.id, set()))
-    
-    embed.add_field(name="Log Channel", value=log_channel, inline=True)
-    embed.add_field(name="Quarantine Role", value=quarantine_role, inline=True)
-    embed.add_field(name="Whitelisted Users", value=str(whitelist_count), inline=True)
+    embed.description += "\n\n" + "\n".join(users)
+    embed.set_footer(text=f"Total: {len(guild_whitelist)} user(s)")
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# Test command - triggers alert manually
-@bot.tree.command(name="test_alert", description="Test the alert system")
-@app_commands.checks.has_permissions(administrator=True)
-async def test_alert(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    await send_alert(interaction.guild, "🧪 This is a test alert!", interaction.user)
-    await interaction.followup.send("Test alert sent!", ephemeral=True)
+# ============= QUARANTINE COMMANDS =============
 
-# Manual Quarantine Command
 @bot.tree.command(name="quarantine", description="Manually quarantine a user")
 @app_commands.checks.has_permissions(administrator=True)
 async def quarantine_cmd(interaction: discord.Interaction, user: discord.Member, reason: str = "Manual quarantine"):
@@ -484,7 +980,6 @@ async def quarantine_cmd(interaction: discord.Interaction, user: discord.Member,
     else:
         await interaction.followup.send(f"❌ Failed to quarantine {user.mention}", ephemeral=True)
 
-# Unquarantine Command
 @bot.tree.command(name="unquarantine", description="Remove quarantine from a user")
 @app_commands.checks.has_permissions(administrator=True)
 async def unquarantine_cmd(interaction: discord.Interaction, user: discord.Member):
@@ -498,28 +993,67 @@ async def unquarantine_cmd(interaction: discord.Interaction, user: discord.Membe
         return
     
     quarantine_role = interaction.guild.get_role(quarantine_role_id)
-    if not quarantine_role:
-        await interaction.followup.send("❌ Quarantine role not found!", ephemeral=True)
-        return
-    
-    if quarantine_role not in user.roles:
+    if not quarantine_role or quarantine_role not in user.roles:
         await interaction.followup.send(f"❌ {user.mention} is not quarantined!", ephemeral=True)
         return
     
     try:
         await user.remove_roles(quarantine_role, reason=f"Unquarantined by {interaction.user.name}")
         
+        stored_roles = await db.get_quarantine_roles(interaction.guild.id, user.id)
+        if stored_roles:
+            roles_to_restore = [interaction.guild.get_role(rid) for rid in stored_roles]
+            roles_to_restore = [r for r in roles_to_restore if r]
+            if roles_to_restore:
+                await user.add_roles(*roles_to_restore, reason="Roles restored after unquarantine")
+        
         await send_alert(
             interaction.guild,
             f"✅ {user.mention} was unquarantined by {interaction.user.mention}",
-            user
+            user,
+            color=discord.Color.green()
         )
         
         await interaction.followup.send(f"✅ Removed quarantine from {user.mention}", ephemeral=True)
     except Exception as e:
+        logger.error(f"Failed to unquarantine user: {e}")
         await interaction.followup.send(f"❌ Failed to unquarantine: {str(e)}", ephemeral=True)
 
-# Lockdown Commands
+@bot.tree.command(name="quarantine_list", description="List all quarantined users")
+@app_commands.checks.has_permissions(administrator=True)
+async def quarantine_list(interaction: discord.Interaction):
+    """Show all quarantined users"""
+    config = server_configs.get(interaction.guild.id, {})
+    quarantine_role_id = config.get('quarantine_role_id')
+    
+    if not quarantine_role_id:
+        await interaction.response.send_message("❌ Quarantine role not set up!", ephemeral=True)
+        return
+    
+    quarantine_role = interaction.guild.get_role(quarantine_role_id)
+    if not quarantine_role:
+        await interaction.response.send_message("❌ Quarantine role not found!", ephemeral=True)
+        return
+    
+    quarantined_members = [member for member in interaction.guild.members if quarantine_role in member.roles]
+    
+    if not quarantined_members:
+        await interaction.response.send_message("✅ No users are currently quarantined.", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title="🔒 Quarantined Users",
+        color=discord.Color.dark_grey()
+    )
+    
+    users_list = "\n".join([f"• {member.mention} ({member.name})" for member in quarantined_members])
+    embed.description = users_list
+    embed.set_footer(text=f"Total: {len(quarantined_members)} user(s)")
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ============= LOCKDOWN COMMANDS =============
+
 @bot.tree.command(name="lockdown_enable", description="Lock down the server (emergency mode)")
 @app_commands.checks.has_permissions(administrator=True)
 async def lockdown_enable(interaction: discord.Interaction):
@@ -528,29 +1062,26 @@ async def lockdown_enable(interaction: discord.Interaction):
     guild = interaction.guild
     
     try:
-        # Remove @everyone permissions to send messages and add reactions
-        everyone_role = guild.default_role
-        permissions = everyone_role.permissions
-        permissions.update(
-            send_messages=False,
-            add_reactions=False,
-            create_instant_invite=False
-        )
+        for channel in guild.text_channels:
+            await channel.set_permissions(
+                guild.default_role,
+                send_messages=False,
+                add_reactions=False,
+                create_instant_invite=False
+            )
         
-        await everyone_role.edit(permissions=permissions, reason="Server lockdown activated")
-        
-        # Update database
         await db.update_server_field(guild.id, 'lockdown_enabled', True)
         if guild.id not in server_configs:
             server_configs[guild.id] = {}
         server_configs[guild.id]['lockdown_enabled'] = True
         
-        # Send alert
         await send_alert(
             guild,
             f"🔒 **SERVER LOCKDOWN ACTIVATED**\n"
             f"Initiated by {interaction.user.mention}\n"
-            f"All members restricted from sending messages and reacting."
+            f"All members restricted from sending messages and reacting.",
+            color=discord.Color.orange(),
+            email_admins=True
         )
         
         await interaction.followup.send(
@@ -562,6 +1093,7 @@ async def lockdown_enable(interaction: discord.Interaction):
             ephemeral=True
         )
     except Exception as e:
+        logger.error(f"Failed to enable lockdown: {e}")
         await interaction.followup.send(f"❌ Failed to enable lockdown: {str(e)}", ephemeral=True)
 
 @bot.tree.command(name="lockdown_disable", description="Disable server lockdown")
@@ -572,39 +1104,277 @@ async def lockdown_disable(interaction: discord.Interaction):
     guild = interaction.guild
     
     try:
-        # Restore @everyone permissions
-        everyone_role = guild.default_role
-        permissions = everyone_role.permissions
-        permissions.update(
-            send_messages=True,
-            add_reactions=True,
-            create_instant_invite=True
-        )
+        for channel in guild.text_channels:
+            await channel.set_permissions(
+                guild.default_role,
+                send_messages=None,
+                add_reactions=None,
+                create_instant_invite=None
+            )
         
-        await everyone_role.edit(permissions=permissions, reason="Server lockdown lifted")
-        
-        # Update database
         await db.update_server_field(guild.id, 'lockdown_enabled', False)
         if guild.id in server_configs:
             server_configs[guild.id]['lockdown_enabled'] = False
         
-        # Send alert
-        await send_alert(
-            guild,
-            f"🔓 **SERVER LOCKDOWN LIFTED**\n"
-            f"Lifted by {interaction.user.mention}\n"
-            f"Normal permissions restored."
-        )
+        await log_action(guild, 'security', 'Lockdown Disabled', interaction.user,
+                        "Server lockdown lifted - Normal permissions restored")
         
         await interaction.followup.send(
-            "🔓 Server lockdown has been lifted!\n"
-            "Normal permissions restored.",
+            "🔓 Server lockdown has been lifted!\nNormal permissions restored.",
             ephemeral=True
         )
     except Exception as e:
+        logger.error(f"Failed to disable lockdown: {e}")
         await interaction.followup.send(f"❌ Failed to disable lockdown: {str(e)}", ephemeral=True)
 
-# Verification System
+# ============= STATUS COMMAND =============
+
+@bot.tree.command(name="status", description="Show bot protection status")
+async def status(interaction: discord.Interaction):
+    config = server_configs.get(interaction.guild.id, {})
+    
+    embed = discord.Embed(
+        title="🛡️ Security Bot Status",
+        color=discord.Color.blue(),
+        timestamp=datetime.now()
+    )
+    
+    log_channel = "✅ Configured" if config.get('log_channel_id') else "❌ Not Set"
+    quarantine_role = "✅ Configured" if config.get('quarantine_role_id') else "❌ Not Set"
+    verification = "✅ Enabled" if config.get('verification_enabled') else "❌ Disabled"
+    lockdown = "🔒 Active" if config.get('lockdown_enabled') else "🔓 Inactive"
+    whitelist_count = len(whitelists.get(interaction.guild.id, set()))
+    
+    embed.add_field(name="Log Channel", value=log_channel, inline=True)
+    embed.add_field(name="Quarantine Role", value=quarantine_role, inline=True)
+    embed.add_field(name="Verification", value=verification, inline=True)
+    embed.add_field(name="Lockdown Status", value=lockdown, inline=True)
+    embed.add_field(name="Whitelisted Users", value=str(whitelist_count), inline=True)
+    
+    try:
+        current_threat = await db.get_current_threat_level(interaction.guild.id)
+        threat_level = current_threat.get('threat_level', 0)
+        threat_info = THREAT_LEVELS.get(threat_level, THREAT_LEVELS[0])
+        embed.add_field(name="Threat Level", value=threat_info['name'], inline=True)
+    except:
+        embed.add_field(name="Threat Level", value="🟢 Clear", inline=True)
+    
+    user_email = await db.get_user_email(interaction.guild.id, interaction.user.id)
+    email_status = "✅ Enabled" if user_email else "❌ Not Set"
+    embed.add_field(name="Your Email Alerts", value=email_status, inline=True)
+    
+    embed.set_footer(text=f"Monitoring {len(interaction.guild.members)} members")
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ============= VERIFICATION VIEW CLASSES =============
+
+class VerificationView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+    
+    @discord.ui.button(label="Verify", style=discord.ButtonStyle.green, custom_id="verify_button")
+    async def verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        config = server_configs.get(interaction.guild.id, {})
+        verified_role_id = config.get('verified_role_id')
+        unverified_role_id = config.get('unverified_role_id')
+        
+        if not verified_role_id:
+            await interaction.response.send_message(
+                "❌ Verification system error. Contact an administrator.",
+                ephemeral=True
+            )
+            return
+        
+        verified_role = interaction.guild.get_role(verified_role_id)
+        unverified_role = interaction.guild.get_role(unverified_role_id)
+        
+        member = interaction.user
+        
+        if verified_role and verified_role in member.roles:
+            await interaction.response.send_message(
+                "✅ You are already verified!",
+                ephemeral=True
+            )
+            return
+        
+        try:
+            if verified_role and verified_role not in member.roles:
+                await member.add_roles(verified_role, reason="Member verified")
+            
+            if unverified_role and unverified_role in member.roles:
+                await member.remove_roles(unverified_role, reason="Member verified")
+            
+            await interaction.response.send_message(
+                "✅ You have been verified! Welcome to the server!",
+                ephemeral=True
+            )
+            
+            await log_action(interaction.guild, 'verification', 'User Verified',
+                            member, f"{member.mention} verified via button")
+            
+            await db.add_log(
+                interaction.guild.id,
+                'member_verified',
+                member.id,
+                details={'verification_method': 'button'}
+            )
+        except Exception as e:
+            logger.error(f"Verification error: {e}")
+            await interaction.response.send_message(
+                "❌ Verification failed. Please contact an administrator.",
+                ephemeral=True
+            )
+
+class RobloxVerificationView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+    
+    @discord.ui.button(label="Start Verification", style=discord.ButtonStyle.green, custom_id="roblox_verify_start")
+    async def start_verification(self, interaction: discord.Interaction, button: discord.ui.Button):
+        verification = await db.get_verification(interaction.guild.id, interaction.user.id)
+        if verification and verification.get('verified'):
+            await interaction.response.send_message(
+                "✅ You are already verified!",
+                ephemeral=True
+            )
+            return
+        
+        code = f"VERIFY-{generate_verification_code()}"
+        
+        await db.create_verification(interaction.guild.id, interaction.user.id, code)
+        
+        embed = discord.Embed(
+            title="🎮 Roblox Verification - Step 1",
+            description=(
+                f"**Your verification code:** `{code}`\n\n"
+                f"**Instructions:**\n"
+                f"1. Go to [Roblox Profile Settings](https://www.roblox.com/my/account#!/info)\n"
+                f"2. Add this code to your **'About' / 'Description'** section\n"
+                f"3. Save your changes\n"
+                f"4. Come back here and click 'I've added the code'\n\n"
+                f"⏰ This code expires in 5 minutes or if you leave and rejoin."
+            ),
+            color=discord.Color.blue()
+        )
+        embed.set_footer(text="Make sure to save your Roblox profile after adding the code!")
+        
+        view = RobloxVerificationConfirmView()
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+class RobloxVerificationConfirmView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=VERIFICATION_TIMEOUT)
+    
+    @discord.ui.button(label="I've added the code", style=discord.ButtonStyle.green, custom_id="roblox_verify_confirm")
+    async def confirm_verification(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        
+        verification = await db.get_verification(interaction.guild.id, interaction.user.id)
+        
+        if not verification:
+            await interaction.followup.send("❌ No verification in progress. Please start verification first.", ephemeral=True)
+            return
+        
+        if verification.get('verified'):
+            await interaction.followup.send("✅ You're already verified!", ephemeral=True)
+            return
+        
+        await interaction.followup.send(
+            "Please reply with your **Roblox username** (type it in chat):",
+            ephemeral=True
+        )
+        
+        def check(m):
+            return m.author == interaction.user and m.channel == interaction.channel
+        
+        try:
+            msg = await bot.wait_for('message', timeout=60.0, check=check)
+            roblox_username = msg.content.strip()
+            
+            try:
+                await msg.delete()
+            except:
+                pass
+            
+            await interaction.followup.send("🔍 Checking your Roblox profile...", ephemeral=True)
+            
+            roblox_data = await get_roblox_user_info(roblox_username)
+            
+            if not roblox_data:
+                await interaction.followup.send(
+                    f"❌ Could not find Roblox user '{roblox_username}'. Please check the username and try again.",
+                    ephemeral=True
+                )
+                return
+            
+            if verification['verification_code'] not in roblox_data['description']:
+                await interaction.followup.send(
+                    f"❌ Verification code not found in your Roblox profile description.\n\n"
+                    f"Make sure you added `{verification['verification_code']}` to your profile and saved it.",
+                    ephemeral=True
+                )
+                return
+            
+            await db.complete_verification(
+                interaction.guild.id,
+                interaction.user.id,
+                roblox_data['id'],
+                roblox_data['username']
+            )
+            
+            config = server_configs.get(interaction.guild.id, {})
+            verified_role_id = config.get('verified_role_id')
+            unverified_role_id = config.get('unverified_role_id')
+            
+            member = interaction.user
+            
+            if verified_role_id:
+                verified_role = interaction.guild.get_role(verified_role_id)
+                if verified_role and verified_role not in member.roles:
+                    await member.add_roles(verified_role, reason="Roblox verification successful")
+            
+            if unverified_role_id:
+                unverified_role = interaction.guild.get_role(unverified_role_id)
+                if unverified_role and unverified_role in member.roles:
+                    await member.remove_roles(unverified_role, reason="Roblox verification successful")
+            
+            embed = discord.Embed(
+                title="✅ Verification Successful!",
+                description=(
+                    f"**Roblox Account:** {roblox_data['username']}\n"
+                    f"**Display Name:** {roblox_data['displayName']}\n"
+                    f"**Roblox ID:** {roblox_data['id']}\n\n"
+                    f"You now have access to the server!\n\n"
+                    f"⚠️ Remember to remove the verification code from your Roblox profile."
+                ),
+                color=discord.Color.green()
+            )
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            
+            await log_action(interaction.guild, 'verification', 'Roblox Verification Completed',
+                           member, f"Verified as {roblox_data['username']}",
+                           extra_info={'Roblox Username': roblox_data['username'], 'Roblox ID': roblox_data['id']})
+            
+            await db.add_log(
+                interaction.guild.id,
+                'roblox_verified',
+                member.id,
+                details={
+                    'roblox_username': roblox_data['username'],
+                    'roblox_id': roblox_data['id']
+                }
+            )
+            
+        except asyncio.TimeoutError:
+            await interaction.followup.send("❌ Verification timed out. Please try again.", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error in Roblox verification: {e}")
+            await interaction.followup.send(f"❌ Verification error: {str(e)}", ephemeral=True)
+
+# ============= VERIFICATION COMMANDS =============
+
 @bot.tree.command(name="setup_verification", description="Set up verification system for new members")
 @app_commands.checks.has_permissions(administrator=True)
 async def setup_verification(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -612,7 +1382,6 @@ async def setup_verification(interaction: discord.Interaction, channel: discord.
     
     guild = interaction.guild
     
-    # Create Unverified role
     unverified_role = await guild.create_role(
         name="Unverified",
         color=discord.Color.light_grey(),
@@ -620,14 +1389,12 @@ async def setup_verification(interaction: discord.Interaction, channel: discord.
         reason="Verification system - unverified members"
     )
     
-    # Create Verified/Member role (or they can use existing one)
     verified_role = await guild.create_role(
         name="Verified",
         color=discord.Color.green(),
         reason="Verification system - verified members"
     )
     
-    # Update database
     await db.set_server_config(
         guild.id,
         unverified_role_id=unverified_role.id,
@@ -636,7 +1403,6 @@ async def setup_verification(interaction: discord.Interaction, channel: discord.
         verification_enabled=True
     )
     
-    # Update in-memory cache
     if guild.id not in server_configs:
         server_configs[guild.id] = {}
     server_configs[guild.id].update({
@@ -646,13 +1412,13 @@ async def setup_verification(interaction: discord.Interaction, channel: discord.
         'verification_enabled': True
     })
     
-    # Send verification message with button
     view = VerificationView()
     embed = discord.Embed(
         title="✅ Welcome to the Server!",
         description="Please click the button below to verify and gain access to the server.",
         color=discord.Color.blue()
     )
+    embed.set_footer(text="Click the Verify button to get started!")
     await channel.send(embed=embed, view=view)
     
     await interaction.followup.send(
@@ -696,141 +1462,7 @@ async def verification_disable(interaction: discord.Interaction):
         ephemeral=True
     )
 
-# Verification Button View
-class VerificationView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)  # Never timeout
-    
-    @discord.ui.button(label="Verify", style=discord.ButtonStyle.green, custom_id="verify_button")
-    async def verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        config = server_configs.get(interaction.guild.id, {})
-        verified_role_id = config.get('verified_role_id')
-        unverified_role_id = config.get('unverified_role_id')
-        
-        if not verified_role_id:
-            await interaction.response.send_message(
-                "❌ Verification system error. Contact an administrator.",
-                ephemeral=True
-            )
-            return
-        
-        verified_role = interaction.guild.get_role(verified_role_id)
-        unverified_role = interaction.guild.get_role(unverified_role_id)
-        
-        member = interaction.user
-        
-        # Add verified role
-        if verified_role and verified_role not in member.roles:
-            await member.add_roles(verified_role, reason="Member verified")
-        
-        # Remove unverified role
-        if unverified_role and unverified_role in member.roles:
-            await member.remove_roles(unverified_role, reason="Member verified")
-        
-        await interaction.response.send_message(
-            "✅ You have been verified! Welcome to the server!",
-            ephemeral=True
-        )
-        
-        # Send completion message in log channel
-        config = server_configs.get(interaction.guild.id, {})
-        log_channel_id = config.get('log_channel_id')
-        if log_channel_id:
-            log_channel = interaction.guild.get_channel(log_channel_id)
-            if log_channel:
-                log_embed = discord.Embed(
-                    title="✅ Discord Verification Completed",
-                    description=f"{member.mention} has been verified!",
-                    color=discord.Color.green()
-                )
-                log_embed.add_field(name="User", value=f"{member.name} ({member.id})", inline=False)
-                await log_channel.send(embed=log_embed)
-        
-        # Log verification
-        await db.add_log(
-            interaction.guild.id,
-            'member_verified',
-            member.id,
-            details={'verification_method': 'button'}
-        )
-
-# Handle new member joins for verification
-@bot.event
-async def on_member_join(member):
-    guild = member.guild
-    config = server_configs.get(guild.id, {})
-    
-    # Check if verification is enabled
-    if config.get('verification_enabled'):
-        unverified_role_id = config.get('unverified_role_id')
-        if unverified_role_id:
-            unverified_role = guild.get_role(unverified_role_id)
-            if unverified_role:
-                await member.add_roles(unverified_role, reason="New member - needs verification")
-                
-                # Send DM with verification instructions
-                verification_channel_id = config.get('verification_channel_id')
-                if verification_channel_id:
-                    channel = guild.get_channel(verification_channel_id)
-                    try:
-                        await member.send(
-                            f"Welcome to **{guild.name}**! 🎉\n\n"
-                            f"Please verify yourself in {channel.mention} to gain access to the server."
-                        )
-                    except:
-                        pass  # User has DMs disabled
-    
-    # Mass join detection (existing code)
-    now = datetime.now()
-    join_tracker[guild.id].append(now)
-    
-    cutoff = now - timedelta(seconds=DEFAULT_THRESHOLDS['mass_join']['seconds'])
-    join_tracker[guild.id] = [t for t in join_tracker[guild.id] if t > cutoff]
-    
-    count = len(join_tracker[guild.id])
-    threshold = DEFAULT_THRESHOLDS['mass_join']
-    
-    if count >= threshold['count']:
-        await send_alert(guild,
-            f"⚠️ **POSSIBLE RAID DETECTED**\n"
-            f"{count} accounts joined in {threshold['seconds']} seconds!\n"
-            f"Consider enabling verification or lockdown.")
-
-# ============= ROBLOX VERIFICATION SYSTEM =============
-
-def generate_verification_code():
-    """Generate a random verification code"""
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-
-async def get_roblox_user_info(username):
-    """Get Roblox user info from username"""
-    try:
-        async with aiohttp.ClientSession() as session:
-            # Get user ID from username
-            async with session.post(
-                'https://users.roblox.com/v1/usernames/users',
-                json={'usernames': [username], 'excludeBannedUsers': True}
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get('data') and len(data['data']) > 0:
-                        user_data = data['data'][0]
-                        user_id = user_data['id']
-                        
-                        # Get user profile description
-                        async with session.get(f'https://users.roblox.com/v1/users/{user_id}') as profile_resp:
-                            if profile_resp.status == 200:
-                                profile_data = await profile_resp.json()
-                                return {
-                                    'id': user_id,
-                                    'username': user_data['name'],
-                                    'displayName': user_data['displayName'],
-                                    'description': profile_data.get('description', '')
-                                }
-        return None
-    except Exception as e:
-        print(f'Error fetching Roblox user: {e}')
-        return None
+# ============= ROBLOX VERIFICATION COMMANDS =============
 
 @bot.tree.command(name="setup_roblox_verification", description="Set up Roblox verification system")
 @app_commands.checks.has_permissions(administrator=True)
@@ -840,7 +1472,6 @@ async def setup_roblox_verification(interaction: discord.Interaction, channel: d
         
         guild = interaction.guild
         
-        # Create Unverified role if doesn't exist
         unverified_role = discord.utils.get(guild.roles, name="Unverified")
         if not unverified_role:
             unverified_role = await guild.create_role(
@@ -850,7 +1481,6 @@ async def setup_roblox_verification(interaction: discord.Interaction, channel: d
                 reason="Roblox verification - unverified members"
             )
         
-        # Create Verified role if doesn't exist
         verified_role = discord.utils.get(guild.roles, name="Verified")
         if not verified_role:
             verified_role = await guild.create_role(
@@ -859,16 +1489,14 @@ async def setup_roblox_verification(interaction: discord.Interaction, channel: d
                 reason="Roblox verification - verified members"
             )
         
-        # Update database
         await db.set_server_config(
             guild.id,
             unverified_role_id=unverified_role.id,
             verified_role_id=verified_role.id,
             verification_channel_id=channel.id,
-            verification_enabled=True  # Changed from 1 to True
+            verification_enabled=True
         )
         
-        # Update in-memory cache
         if guild.id not in server_configs:
             server_configs[guild.id] = {}
         server_configs[guild.id].update({
@@ -878,7 +1506,6 @@ async def setup_roblox_verification(interaction: discord.Interaction, channel: d
             'verification_enabled': True
         })
         
-        # Send verification message with button
         view = RobloxVerificationView()
         embed = discord.Embed(
             title="🎮 Roblox Verification",
@@ -888,12 +1515,13 @@ async def setup_roblox_verification(interaction: discord.Interaction, channel: d
                 "1. Click the button below\n"
                 "2. You'll receive a unique code\n"
                 "3. Add the code to your Roblox profile description\n"
-                "4. Click 'I've added the code'\n"
+                "4. Submit your Roblox username\n"
                 "5. Remove the code after verification!\n\n"
                 "✅ You'll be verified and gain access to the server!"
             ),
             color=discord.Color.blue()
         )
+        embed.set_footer(text="Click 'Start Verification' to begin!")
         await channel.send(embed=embed, view=view)
         
         await interaction.followup.send(
@@ -905,607 +1533,105 @@ async def setup_roblox_verification(interaction: discord.Interaction, channel: d
             ephemeral=True
         )
     except Exception as e:
-        print(f"Error in setup_roblox_verification: {e}")
+        logger.error(f"Error in setup_roblox_verification: {e}")
         await interaction.followup.send(f"❌ Error setting up verification: {str(e)}", ephemeral=True)
 
-class RobloxVerificationView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-    
-    @discord.ui.button(label="Start Verification", style=discord.ButtonStyle.green, custom_id="roblox_verify_start")
-    async def start_verification(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Generate verification code
-        code = f"VERIFY-{generate_verification_code()}"
-        
-        # Save to database
-        await db.create_verification(interaction.guild.id, interaction.user.id, code)
-        
-        embed = discord.Embed(
-            title="🎮 Roblox Verification - Step 1",
-            description=(
-                f"**Your verification code:** `{code}`\n\n"
-                f"**Instructions:**\n"
-                f"1. Go to [Roblox Profile Settings](https://www.roblox.com/my/account#!/info)\n"
-                f"2. Add this code to your **'About' / 'Description'** section\n"
-                f"3. Save your changes\n"
-                f"4. Come back here and click 'I've added the code'\n\n"
-                f"⏰ This code expires if you leave and rejoin."
-            ),
-            color=discord.Color.blue()
-        )
-        
-        view = RobloxVerificationConfirmView()
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-class RobloxVerificationConfirmView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)  # 5 minute timeout
-    
-    @discord.ui.button(label="I've added the code", style=discord.ButtonStyle.green, custom_id="roblox_verify_confirm")
-    async def confirm_verification(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        
-        # Get verification data
-        verification = await db.get_verification(interaction.guild.id, interaction.user.id)
-        
-        if not verification:
-            await interaction.followup.send("❌ No verification in progress. Please start verification first.", ephemeral=True)
-            return
-        
-        if verification.get('verified'):
-            await interaction.followup.send("✅ You're already verified!", ephemeral=True)
-            return
-        
-        # Ask for Roblox username
-        await interaction.followup.send(
-            "Please reply with your **Roblox username** (type it in chat):",
-            ephemeral=True
-        )
-        
-        def check(m):
-            return m.author == interaction.user and m.channel == interaction.channel
-        
-        try:
-            msg = await bot.wait_for('message', timeout=60.0, check=check)
-            roblox_username = msg.content.strip()
-            
-            # Delete user's message
-            try:
-                await msg.delete()
-            except:
-                pass
-            
-            # Fetch Roblox profile
-            await interaction.followup.send("🔍 Checking your Roblox profile...", ephemeral=True)
-            
-            roblox_data = await get_roblox_user_info(roblox_username)
-            
-            if not roblox_data:
-                await interaction.followup.send(
-                    f"❌ Could not find Roblox user '{roblox_username}'. Please check the username and try again.",
-                    ephemeral=True
-                )
-                return
-            
-            # Check if code is in description
-            if verification['verification_code'] not in roblox_data['description']:
-                await interaction.followup.send(
-                    f"❌ Verification code not found in your Roblox profile description.\n\n"
-                    f"Make sure you added `{verification['verification_code']}` to your profile and saved it.",
-                    ephemeral=True
-                )
-                return
-            
-            # Verification successful!
-            await db.complete_verification(
-                interaction.guild.id,
-                interaction.user.id,
-                roblox_data['id'],
-                roblox_data['username']
-            )
-            
-            # Assign verified role
-            config = server_configs.get(interaction.guild.id, {})
-            verified_role_id = config.get('verified_role_id')
-            unverified_role_id = config.get('unverified_role_id')
-            
-            member = interaction.user
-            
-            if verified_role_id:
-                verified_role = interaction.guild.get_role(verified_role_id)
-                if verified_role and verified_role not in member.roles:
-                    await member.add_roles(verified_role, reason="Roblox verification successful")
-            
-            if unverified_role_id:
-                unverified_role = interaction.guild.get_role(unverified_role_id)
-                if unverified_role and unverified_role in member.roles:
-                    await member.remove_roles(unverified_role, reason="Roblox verification successful")
-            
-            embed = discord.Embed(
-                title="✅ Verification Successful!",
-                description=(
-                    f"**Roblox Account:** {roblox_data['username']}\n"
-                    f"**Display Name:** {roblox_data['displayName']}\n\n"
-                    f"You now have access to the server!\n\n"
-                    f"⚠️ Remember to remove the verification code from your Roblox profile."
-                ),
-                color=discord.Color.green()
-            )
-            
-            await interaction.followup.send(embed=embed, ephemeral=True)
-            
-            # Send completion message in log channel
-            config = server_configs.get(interaction.guild.id, {})
-            log_channel_id = config.get('log_channel_id')
-            if log_channel_id:
-                log_channel = interaction.guild.get_channel(log_channel_id)
-                if log_channel:
-                    log_embed = discord.Embed(
-                        title="🎮 Roblox Verification Completed",
-                        color=discord.Color.green()
-                    )
-                    log_embed.add_field(name="Discord User", value=member.mention, inline=True)
-                    log_embed.add_field(name="Roblox Username", value=roblox_data['username'], inline=True)
-                    log_embed.add_field(name="Roblox ID", value=str(roblox_data['id']), inline=True)
-                    await log_channel.send(embed=log_embed)
-            
-            # Log verification
-            await db.add_log(
-                interaction.guild.id,
-                'roblox_verified',
-                member.id,
-                details={
-                    'roblox_username': roblox_data['username'],
-                    'roblox_id': roblox_data['id']
-                }
-            )
-            
-        except asyncio.TimeoutError:
-            await interaction.followup.send("❌ Verification timed out. Please try again.", ephemeral=True)
-
-# ============= PARTNERSHIP SYSTEM =============
-
-@bot.tree.command(name="partnership_list", description="View all partnerships")
+@bot.tree.command(name="whois", description="Show linked Roblox account for a user")
 @app_commands.checks.has_permissions(manage_guild=True)
-async def partnership_list(interaction: discord.Interaction, status: str = "all"):
-    """List partnerships by status"""
+async def whois_command(interaction: discord.Interaction, user: discord.Member):
+    """Show user's linked Roblox account"""
     await interaction.response.defer(ephemeral=True)
     
-    try:
-        print(f"DEBUG: Fetching partnerships for guild {interaction.guild.id}, status: {status}")
-        
-        if status == "all":
-            pending = await db.get_partnerships_by_status(interaction.guild.id, 'pending')
-            approved = await db.get_partnerships_by_status(interaction.guild.id, 'approved')
-            denied = await db.get_partnerships_by_status(interaction.guild.id, 'denied')
-            all_partnerships = pending + approved + denied
-            print(f"DEBUG: Found {len(pending)} pending, {len(approved)} approved, {len(denied)} denied")
-        else:
-            all_partnerships = await db.get_partnerships_by_status(interaction.guild.id, status)
-            print(f"DEBUG: Found {len(all_partnerships)} partnerships with status {status}")
-        
-        if not all_partnerships:
-            await interaction.followup.send(f"No partnerships found with status: {status}", ephemeral=True)
-            return
-        
-        embed = discord.Embed(
-            title=f"📋 Partnerships ({status.title()})",
-            color=discord.Color.blue()
-        )
-        
-        for partnership in all_partnerships[:10]:  # Limit to 10
-            status_emoji = {"pending": "⏳", "approved": "✅", "denied": "❌"}.get(partnership['status'], "❓")
-            
-            # Format the partnership date
-            partner_date = partnership.get('partnership_date', 'N/A')
-            if partner_date and partner_date != 'N/A':
-                if hasattr(partner_date, 'strftime'):
-                    partner_date = partner_date.strftime('%Y-%m-%d')
-                else:
-                    partner_date = str(partner_date)
-            
-            embed.add_field(
-                name=f"{status_emoji} {partnership['partner_server_name']} (ID: {partnership['id']})",
-                value=(
-                    f"**Type:** {partnership['partnership_type'].title()}\n"
-                    f"**Status:** {partnership['status'].title()}\n"
-                    f"**Date:** {partner_date}\n"
-                    f"**Rep:** {partnership['representative']}"
-                ),
-                inline=False
-            )
-        
-        if len(all_partnerships) > 10:
-            embed.set_footer(text=f"Showing 10 of {len(all_partnerships)} partnerships")
-        
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    except Exception as e:
-        print(f"Error in partnership_list: {e}")
-        await interaction.followup.send(f"❌ Error loading partnerships: {str(e)}", ephemeral=True)
-
-@bot.tree.command(name="partnership_submit", description="Submit a partnership application")
-async def partnership_submit(interaction: discord.Interaction):
-    """Open partnership submission form"""
-    # Check if user has Partnership Manager role or admin
-    has_permission = interaction.user.guild_permissions.administrator
+    verification = await db.get_verification(interaction.guild.id, user.id)
     
-    if not has_permission:
-        # Check for Partnership Manager role
-        partnership_role = discord.utils.get(interaction.guild.roles, name="Partnership Manager")
-        if partnership_role and partnership_role in interaction.user.roles:
-            has_permission = True
-    
-    if not has_permission:
-        await interaction.response.send_message(
-            "❌ You need the 'Partnership Manager' role or Administrator permission to use this command.",
+    if not verification or not verification.get('verified'):
+        await interaction.followup.send(
+            f"{user.mention} has not verified their Roblox account.",
             ephemeral=True
         )
         return
-    
-    # Send modal immediately - no try/except needed here
-    await interaction.response.send_modal(PartnershipSubmitModal())
-
-class PartnershipSubmitModal(discord.ui.Modal, title="Partnership Application"):
-    server_name = discord.ui.TextInput(
-        label="Server Name",
-        placeholder="Enter the partner server name",
-        required=True,
-        max_length=100
-    )
-    
-    invite_link = discord.ui.TextInput(
-        label="Server Invite Link",
-        placeholder="https://discord.gg/...",
-        required=True,
-        max_length=200
-    )
-    
-    description = discord.ui.TextInput(
-        label="Server Description/Ad",
-        placeholder="Describe the server and what makes it special",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=1000
-    )
-    
-    representative = discord.ui.TextInput(
-        label="Representative",
-        placeholder="Who should be contacted? (e.g., @username or User#1234)",
-        required=True,
-        max_length=100
-    )
-    
-    member_count = discord.ui.TextInput(
-        label="Approximate Member Count",
-        placeholder="e.g., 1000",
-        required=False,
-        max_length=10
-    )
-    
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        
-        # Show partnership type and benefits selection
-        view = PartnershipTypeView(
-            server_name=self.server_name.value,
-            invite_link=self.invite_link.value,
-            description=self.description.value,
-            representative=self.representative.value,
-            member_count=int(self.member_count.value) if self.member_count.value.isdigit() else 0
-        )
-        
-        await interaction.followup.send(
-            "Please select the partnership type and provide benefits:",
-            view=view,
-            ephemeral=True
-        )
-
-class PartnershipTypeView(discord.ui.View):
-    def __init__(self, server_name, invite_link, description, representative, member_count):
-        super().__init__(timeout=180)
-        self.server_name = server_name
-        self.invite_link = invite_link
-        self.description = description
-        self.representative = representative
-        self.member_count = member_count
-        self.partnership_type = None
-    
-    @discord.ui.select(
-        placeholder="Select Partnership Type",
-        options=[
-            discord.SelectOption(label="Standard", description="Regular partnership with basic benefits", value="standard"),
-            discord.SelectOption(label="Premium", description="Enhanced partnership with extra features", value="premium"),
-            discord.SelectOption(label="Featured", description="Top-tier partnership with maximum exposure", value="featured")
-        ]
-    )
-    async def select_type(self, interaction: discord.Interaction, select: discord.ui.Select):
-        self.partnership_type = select.values[0]
-        await interaction.response.send_modal(PartnershipBenefitsModal(self))
-
-class PartnershipBenefitsModal(discord.ui.Modal, title="Partnership Benefits"):
-    benefits = discord.ui.TextInput(
-        label="Partnership Benefits",
-        placeholder="What does each server get from this partnership?",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=500
-    )
-    
-    partnership_date = discord.ui.TextInput(
-        label="Partnership Start Date",
-        placeholder="YYYY-MM-DD (e.g., 2025-01-15)",
-        required=True,
-        max_length=10
-    )
-    
-    def __init__(self, parent_view):
-        super().__init__()
-        self.parent_view = parent_view
-    
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        
-        # Parse the date string to proper date format
-        try:
-            from datetime import datetime
-            date_obj = datetime.strptime(self.partnership_date.value, '%Y-%m-%d').date()
-        except ValueError:
-            await interaction.followup.send(
-                "❌ Invalid date format! Please use YYYY-MM-DD (e.g., 2025-01-15)",
-                ephemeral=True
-            )
-            return
-        
-        # Create partnership in database
-        partnership_data = {
-            'server_name': self.parent_view.server_name,
-            'invite_link': self.parent_view.invite_link,
-            'description': self.parent_view.description,
-            'representative': self.parent_view.representative,
-            'partnership_date': date_obj,  # Now a proper date object
-            'partnership_type': self.parent_view.partnership_type,
-            'benefits': self.benefits.value,
-            'member_count': self.parent_view.member_count
-        }
-        
-        partnership_id = await db.create_partnership(
-            interaction.guild.id,
-            partnership_data,
-            interaction.user.id
-        )
-        
-        # Send to approval channel
-        config = server_configs.get(interaction.guild.id, {})
-        log_channel_id = config.get('log_channel_id')
-        
-        if log_channel_id:
-            channel = interaction.guild.get_channel(log_channel_id)
-            if channel:
-                embed = discord.Embed(
-                    title="📋 New Partnership Application",
-                    color=discord.Color.gold()
-                )
-                embed.add_field(name="Server Name", value=partnership_data['server_name'], inline=True)
-                embed.add_field(name="Type", value=partnership_data['partnership_type'].title(), inline=True)
-                embed.add_field(name="Member Count", value=str(partnership_data['member_count']) if partnership_data['member_count'] else "N/A", inline=True)
-                embed.add_field(name="Invite Link", value=partnership_data['invite_link'], inline=False)
-                embed.add_field(name="Description", value=partnership_data['description'], inline=False)
-                embed.add_field(name="Representative", value=partnership_data['representative'], inline=True)
-                embed.add_field(name="Partnership Date", value=partnership_data['partnership_date'], inline=True)
-                embed.add_field(name="Benefits", value=partnership_data['benefits'], inline=False)
-                embed.add_field(name="Submitted By", value=interaction.user.mention, inline=True)
-                embed.set_footer(text=f"Partnership ID: {partnership_id}")
-                
-                view = PartnershipApprovalView(partnership_id)
-                await channel.send(embed=embed, view=view)
-        
-        await interaction.followup.send(
-            f"✅ Partnership application submitted! (ID: {partnership_id})\n"
-            f"Waiting for approval from Partnership Approvers.",
-            ephemeral=True
-        )
-
-class PartnershipApprovalView(discord.ui.View):
-    def __init__(self, partnership_id):
-        super().__init__(timeout=None)
-        self.partnership_id = partnership_id
-    
-    @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.green, custom_id=f"partner_approve")
-    async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Check if user has permission
-        if not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message(
-                "❌ You need 'Manage Server' permission to approve partnerships.",
-                ephemeral=True
-            )
-            return
-        
-        await interaction.response.defer()
-        
-        # Get partnership details
-        partnership = await db.get_partnership(self.partnership_id)
-        if not partnership:
-            await interaction.followup.send("❌ Partnership not found.", ephemeral=True)
-            return
-        
-        # Approve partnership
-        await db.approve_partnership(self.partnership_id, interaction.user.id)
-        
-        # Post ad in partnership channel (use log channel for now)
-        config = server_configs.get(interaction.guild.id, {})
-        log_channel_id = config.get('log_channel_id')
-        
-        if log_channel_id:
-            channel = interaction.guild.get_channel(log_channel_id)
-            if channel:
-                ad_embed = discord.Embed(
-                    title=f"🤝 {partnership['partner_server_name']}",
-                    description=partnership['partner_description'],
-                    color=discord.Color.blue()
-                )
-                ad_embed.add_field(name="Join Here", value=f"[Click to Join]({partnership['partner_invite_link']})", inline=False)
-                ad_embed.add_field(name="Representative", value=partnership['representative'], inline=True)
-                ad_embed.add_field(name="Partnership Type", value=partnership['partnership_type'].title(), inline=True)
-                ad_embed.set_footer(text=f"Partnership approved by {interaction.user.name}")
-                
-                await channel.send(embed=ad_embed)
-        
-        # Update original message
-        embed = interaction.message.embeds[0]
-        embed.color = discord.Color.green()
-        embed.title = "✅ Partnership Approved"
-        embed.add_field(name="Approved By", value=interaction.user.mention, inline=True)
-        
-        await interaction.message.edit(embed=embed, view=None)
-        
-        await interaction.followup.send("✅ Partnership approved and posted!", ephemeral=True)
-    
-    @discord.ui.button(label="❌ Deny", style=discord.ButtonStyle.red, custom_id=f"partner_deny")
-    async def deny_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Check if user has permission
-        if not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message(
-                "❌ You need 'Manage Server' permission to deny partnerships.",
-                ephemeral=True
-            )
-            return
-        
-        await interaction.response.defer()
-        
-        # Deny partnership
-        await db.deny_partnership(self.partnership_id, interaction.user.id)
-        
-        # Update original message
-        embed = interaction.message.embeds[0]
-        embed.color = discord.Color.red()
-        embed.title = "❌ Partnership Denied"
-        embed.add_field(name="Denied By", value=interaction.user.mention, inline=True)
-        
-        await interaction.message.edit(embed=embed, view=None)
-        
-        await interaction.followup.send("❌ Partnership denied.", ephemeral=True)
-
-# ============= ADDITIONAL PARTNERSHIP COMMANDS =============
-
-@bot.tree.command(name="partnership_delete", description="Delete a partnership")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def partnership_delete(interaction: discord.Interaction, partnership_id: int):
-    """Delete a partnership by ID"""
-    await interaction.response.defer(ephemeral=True)
-    
-    # Check if partnership exists
-    partnership = await db.get_partnership(partnership_id)
-    if not partnership or partnership['server_id'] != interaction.guild.id:
-        await interaction.followup.send(f"❌ Partnership ID {partnership_id} not found.", ephemeral=True)
-        return
-    
-    await db.delete_partnership(partnership_id)
-    
-    await interaction.followup.send(
-        f"✅ Deleted partnership: {partnership['partner_server_name']} (ID: {partnership_id})",
-        ephemeral=True
-    )
-    
-    # Log deletion
-    await db.add_log(
-        interaction.guild.id,
-        'partnership_deleted',
-        interaction.user.id,
-        details={'partnership_id': partnership_id, 'server_name': partnership['partner_server_name']}
-    )
-
-@bot.tree.command(name="partnership_view", description="View full partnership details")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def partnership_view(interaction: discord.Interaction, partnership_id: int):
-    """View detailed info about a partnership"""
-    await interaction.response.defer(ephemeral=True)
-    
-    partnership = await db.get_partnership(partnership_id)
-    if not partnership or partnership['server_id'] != interaction.guild.id:
-        await interaction.followup.send(f"❌ Partnership ID {partnership_id} not found.", ephemeral=True)
-        return
-    
-    # Format date
-    partner_date = partnership.get('partnership_date', 'N/A')
-    if partner_date and partner_date != 'N/A':
-        if hasattr(partner_date, 'strftime'):
-            partner_date = partner_date.strftime('%Y-%m-%d')
-        else:
-            partner_date = str(partner_date)
-    
-    status_color = {
-        'pending': discord.Color.gold(),
-        'approved': discord.Color.green(),
-        'denied': discord.Color.red()
-    }.get(partnership['status'], discord.Color.blue())
     
     embed = discord.Embed(
-        title=f"📋 Partnership: {partnership['partner_server_name']}",
-        color=status_color
+        title=f"🔍 User Info: {user.name}",
+        color=discord.Color.blue()
     )
-    embed.add_field(name="Partnership ID", value=str(partnership['id']), inline=True)
-    embed.add_field(name="Status", value=partnership['status'].title(), inline=True)
-    embed.add_field(name="Type", value=partnership['partnership_type'].title(), inline=True)
-    embed.add_field(name="Invite Link", value=partnership['partner_invite_link'], inline=False)
-    embed.add_field(name="Description", value=partnership['partner_description'], inline=False)
-    embed.add_field(name="Representative", value=partnership['representative'], inline=True)
-    embed.add_field(name="Partnership Date", value=partner_date, inline=True)
-    embed.add_field(name="Member Count", value=str(partnership.get('member_count', 'N/A')), inline=True)
-    embed.add_field(name="Benefits", value=partnership['benefits'], inline=False)
     
-    submitted_by = bot.get_user(partnership['submitted_by'])
-    embed.add_field(name="Submitted By", value=submitted_by.mention if submitted_by else f"User ID: {partnership['submitted_by']}", inline=True)
+    embed.add_field(name="Discord User", value=user.mention, inline=True)
+    embed.add_field(name="Discord ID", value=str(user.id), inline=True)
+    embed.add_field(name="Roblox Username", value=verification.get('roblox_username', 'Unknown'), inline=True)
+    embed.add_field(name="Roblox ID", value=str(verification.get('roblox_id', 'Unknown')), inline=True)
     
-    if partnership.get('approved_by'):
-        approved_by = bot.get_user(partnership['approved_by'])
-        embed.add_field(name="Approved/Denied By", value=approved_by.mention if approved_by else f"User ID: {partnership['approved_by']}", inline=True)
+    roblox_profile_url = f"https://www.roblox.com/users/{verification.get('roblox_id')}/profile"
+    embed.add_field(name="Roblox Profile", value=f"[View Profile]({roblox_profile_url})", inline=True)
+    
+    verified_at = verification.get('verified_at', 'Unknown')
+    if verified_at and verified_at != 'Unknown':
+        if isinstance(verified_at, str):
+            embed.add_field(name="Verified At", value=verified_at, inline=True)
+        else:
+            embed.add_field(name="Verified At", value=verified_at.strftime('%Y-%m-%d %H:%M:%S'), inline=True)
+    
+    embed.set_thumbnail(url=user.display_avatar.url)
     
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="set_partnership_channel", description="Set dedicated channel for partnership ads")
+@bot.tree.command(name="verify_user", description="Manually verify a user (bypass verification)")
 @app_commands.checks.has_permissions(administrator=True)
-async def set_partnership_channel(interaction: discord.Interaction, channel: discord.TextChannel):
-    """Set partnership ad channel"""
-    await db.update_server_field(interaction.guild.id, 'partnership_channel_id', channel.id)
+async def verify_user(interaction: discord.Interaction, user: discord.Member):
+    """Manually verify a user"""
+    await interaction.response.defer(ephemeral=True)
     
-    if interaction.guild.id not in server_configs:
-        server_configs[interaction.guild.id] = {}
-    server_configs[interaction.guild.id]['partnership_channel_id'] = channel.id
+    config = server_configs.get(interaction.guild.id, {})
+    verified_role_id = config.get('verified_role_id')
+    unverified_role_id = config.get('unverified_role_id')
     
-    await interaction.response.send_message(
-        f"✅ Partnership ad channel set to {channel.mention}",
-        ephemeral=True
-    )
+    if not verified_role_id:
+        await interaction.followup.send("❌ Verification system not set up!", ephemeral=True)
+        return
+    
+    verified_role = interaction.guild.get_role(verified_role_id)
+    unverified_role = interaction.guild.get_role(unverified_role_id)
+    
+    try:
+        if verified_role and verified_role not in user.roles:
+            await user.add_roles(verified_role, reason=f"Manually verified by {interaction.user.name}")
+        
+        if unverified_role and unverified_role in user.roles:
+            await user.remove_roles(unverified_role, reason=f"Manually verified by {interaction.user.name}")
+        
+        await log_action(interaction.guild, 'verification', 'Manual Verification',
+                        interaction.user, f"{user.mention} manually verified",
+                        extra_info={'Target User': user.name})
+        
+        await interaction.followup.send(f"✅ {user.mention} has been manually verified.", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error manually verifying user: {e}")
+        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
 # ============= THREAT LEVEL SYSTEM =============
 
-THREAT_LEVELS = {
-    0: {"name": "🟢 Clear", "color": discord.Color.green(), "description": "Normal operations"},
-    1: {"name": "🟡 Elevated", "color": discord.Color.gold(), "description": "Minor threat detected"},
-    2: {"name": "🟠 High", "color": discord.Color.orange(), "description": "Serious threat - Lockdown engaged"},
-    3: {"name": "🔴 Alpha", "color": discord.Color.red(), "description": "FULL SECURITY BREACH"}
-}
-
-async def apply_threat_level(guild, level, set_by_user):
+async def apply_threat_level(guild: discord.Guild, level: int, set_by_user: discord.User):
     """Apply threat level actions to server"""
     config = server_configs.get(guild.id, {})
     
-    if level == 0:  # Clear - Restore normal
-        # Unlock all channels
+    if level == 0:
         for channel in guild.channels:
-            if isinstance(channel, discord.TextChannel):
-                await channel.set_permissions(guild.default_role, send_messages=None, add_reactions=None)
-            elif isinstance(channel, discord.VoiceChannel):
-                await channel.set_permissions(guild.default_role, connect=None)
+            try:
+                if isinstance(channel, discord.TextChannel):
+                    await channel.set_permissions(guild.default_role, send_messages=None, add_reactions=None, view_channel=None)
+                elif isinstance(channel, discord.VoiceChannel):
+                    await channel.set_permissions(guild.default_role, connect=None, view_channel=None)
+            except:
+                pass
         
-        await send_alert(guild, f"🟢 **Threat Level: CLEAR**\nServer restored to normal operations by {set_by_user.mention}")
+        await send_alert(guild, f"🟢 **Threat Level: CLEAR**\nServer restored to normal operations by {set_by_user.mention}", 
+                        color=discord.Color.green())
     
-    elif level == 1:  # Elevated
-        # Enable verification
+    elif level == 1:
         await db.update_server_field(guild.id, 'verification_enabled', True)
-        server_configs[guild.id]['verification_enabled'] = True
+        if guild.id in server_configs:
+            server_configs[guild.id]['verification_enabled'] = True
         
-        # Alert on-duty staff
         onduty_role_id = config.get('onduty_role_id')
         if onduty_role_id:
             onduty_role = guild.get_role(onduty_role_id)
@@ -1513,26 +1639,31 @@ async def apply_threat_level(guild, level, set_by_user):
                 await send_alert(guild, 
                     f"🟡 **Threat Level: ELEVATED**\n"
                     f"{onduty_role.mention} - Increased security measures active.\n"
-                    f"Set by: {set_by_user.mention}")
+                    f"Verification has been enabled for new members.\n"
+                    f"Set by: {set_by_user.mention}",
+                    color=discord.Color.gold(),
+                    email_admins=True)
         else:
-            await send_alert(guild, f"🟡 **Threat Level: ELEVATED**\nSet by: {set_by_user.mention}")
+            await send_alert(guild, 
+                f"🟡 **Threat Level: ELEVATED**\n"
+                f"Verification has been enabled for new members.\n"
+                f"Set by: {set_by_user.mention}",
+                color=discord.Color.gold(),
+                email_admins=True)
     
-    elif level == 2:  # High
-        # Lock all text channels
+    elif level == 2:
         for channel in guild.text_channels:
             try:
                 await channel.set_permissions(guild.default_role, send_messages=False, add_reactions=False)
             except:
                 pass
         
-        # Lock all voice channels
         for channel in guild.voice_channels:
             try:
                 await channel.set_permissions(guild.default_role, connect=False)
             except:
                 pass
         
-        # Alert on-duty staff via DM
         onduty_role_id = config.get('onduty_role_id')
         if onduty_role_id:
             onduty_role = guild.get_role(onduty_role_id)
@@ -1544,7 +1675,8 @@ async def apply_threat_level(guild, level, set_by_user):
                                 f"🟠 **HIGH THREAT ALERT** 🟠\n"
                                 f"Server: **{guild.name}**\n"
                                 f"All channels have been locked.\n"
-                                f"Set by: {set_by_user.mention}"
+                                f"Set by: {set_by_user.mention}\n\n"
+                                f"Please check the server immediately."
                             )
                         except:
                             pass
@@ -1553,21 +1685,21 @@ async def apply_threat_level(guild, level, set_by_user):
             f"🟠 **Threat Level: HIGH**\n"
             f"⚠️ Server lockdown engaged!\n"
             f"All text and voice channels locked.\n"
-            f"Set by: {set_by_user.mention}")
+            f"Set by: {set_by_user.mention}",
+            color=discord.Color.orange(),
+            email_admins=True)
     
-    elif level == 3:  # Alpha - Full lockdown
-        # Lock ALL channels
+    elif level == 3:
         for channel in guild.text_channels:
             try:
-                await channel.set_permissions(guild.default_role, send_messages=False, add_reactions=False, view_channel=False)
+                await channel.set_permissions(guild.default_role, 
+                    send_messages=False, add_reactions=False, view_channel=False)
             except:
                 pass
         
-        # Lock and kick from voice channels
         for channel in guild.voice_channels:
             try:
                 await channel.set_permissions(guild.default_role, connect=False, view_channel=False)
-                # Kick all members from voice
                 for member in channel.members:
                     if not member.guild_permissions.administrator:
                         try:
@@ -1577,7 +1709,6 @@ async def apply_threat_level(guild, level, set_by_user):
             except:
                 pass
         
-        # Alert ALL staff (on-duty + off-duty)
         allstaff_role_id = config.get('allstaff_role_id')
         if allstaff_role_id:
             allstaff_role = guild.get_role(allstaff_role_id)
@@ -1588,9 +1719,10 @@ async def apply_threat_level(guild, level, set_by_user):
                             await member.send(
                                 f"🚨 **ALPHA ALERT - SECURITY BREACH** 🚨\n"
                                 f"Server: **{guild.name}**\n"
-                                f"FULL LOCKDOWN IN EFFECT\n"
-                                f"All channels locked. All users kicked from voice.\n"
-                                f"RESPOND IMMEDIATELY\n"
+                                f"FULL LOCKDOWN IN EFFECT\n\n"
+                                f"All channels locked and hidden.\n"
+                                f"All users kicked from voice channels.\n\n"
+                                f"⚠️ RESPOND IMMEDIATELY ⚠️\n"
                                 f"Set by: {set_by_user.mention}"
                             )
                         except:
@@ -1598,11 +1730,14 @@ async def apply_threat_level(guild, level, set_by_user):
         
         await send_alert(guild, 
             f"🔴 **THREAT LEVEL: ALPHA** 🔴\n"
-            f"🚨 FULL SECURITY BREACH 🚨\n"
+            f"🚨 FULL SECURITY BREACH 🚨\n\n"
             f"Complete server lockdown engaged.\n"
-            f"All channels hidden and locked.\n"
-            f"All users kicked from voice.\n"
-            f"Set by: {set_by_user.mention}")
+            f"• All channels hidden and locked\n"
+            f"• All users kicked from voice\n"
+            f"• Only administrators can access\n\n"
+            f"Set by: {set_by_user.mention}",
+            color=discord.Color.red(),
+            email_admins=True)
 
 @bot.tree.command(name="threat_set", description="Set server threat level")
 @app_commands.checks.has_permissions(administrator=True)
@@ -1614,30 +1749,20 @@ async def apply_threat_level(guild, level, set_by_user):
 ])
 async def threat_set(interaction: discord.Interaction, level: int, reason: str):
     """Set threat level (0=Clear, 1=Elevated, 2=High, 3=Alpha)"""
-    if level not in [0, 1, 2, 3]:
-        await interaction.response.send_message(
-            "❌ Invalid threat level! Use: 0 (Clear), 1 (Elevated), 2 (High), 3 (Alpha)",
-            ephemeral=True
-        )
-        return
+    await interaction.response.defer(ephemeral=True)  # ADD THIS LINE
     
-    await interaction.response.defer(ephemeral=True)
-    
-    # Save to database
     await db.set_threat_level(interaction.guild.id, level, reason, interaction.user.id)
     
-    # Apply threat level actions
     await apply_threat_level(interaction.guild, level, interaction.user)
     
     level_info = THREAT_LEVELS[level]
-    await interaction.followup.send(
+    await interaction.followup.send(  # CHANGE TO followup
         f"{level_info['name']} **Threat Level Set**\n"
         f"Reason: {reason}\n"
         f"Actions have been applied to the server.",
         ephemeral=True
     )
     
-    # Log threat level change
     await db.add_log(
         interaction.guild.id,
         'threat_level_changed',
@@ -1651,13 +1776,14 @@ async def threat_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     
     current = await db.get_current_threat_level(interaction.guild.id)
-    level = current['threat_level']
+    level = current.get('threat_level', 0)
     level_info = THREAT_LEVELS[level]
     
     embed = discord.Embed(
         title=f"{level_info['name']} - Threat Level Status",
         description=level_info['description'],
-        color=level_info['color']
+        color=level_info['color'],
+        timestamp=datetime.now()
     )
     
     embed.add_field(name="Current Level", value=str(level), inline=True)
@@ -1671,44 +1797,6 @@ async def threat_status(interaction: discord.Interaction):
         set_at = current['set_at']
         if hasattr(set_at, 'strftime'):
             embed.add_field(name="Set At", value=set_at.strftime('%Y-%m-%d %H:%M:%S'), inline=False)
-    
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="threat_history", description="View threat level change history")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def threat_history(interaction: discord.Interaction, count: int = 10):
-    """Show threat level history"""
-    await interaction.response.defer(ephemeral=True)
-    
-    history = await db.get_threat_history(interaction.guild.id, count)
-    
-    if not history:
-        await interaction.followup.send("No threat level history found.", ephemeral=True)
-        return
-    
-    embed = discord.Embed(
-        title="📜 Threat Level History",
-        color=discord.Color.blue()
-    )
-    
-    for entry in history:
-        level = entry['threat_level']
-        level_info = THREAT_LEVELS[level]
-        
-        set_by_user = bot.get_user(entry['set_by']) if entry.get('set_by') else None
-        set_by_str = set_by_user.mention if set_by_user else f"User ID: {entry.get('set_by')}"
-        
-        set_at = entry.get('set_at', 'Unknown')
-        if hasattr(set_at, 'strftime'):
-            set_at_str = set_at.strftime('%Y-%m-%d %H:%M:%S')
-        else:
-            set_at_str = str(set_at)
-        
-        embed.add_field(
-            name=f"{level_info['name']} - {set_at_str}",
-            value=f"Reason: {entry.get('reason', 'N/A')}\nSet by: {set_by_str}",
-            inline=False
-        )
     
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -1743,252 +1831,628 @@ async def set_allstaff_role(interaction: discord.Interaction, role: discord.Role
         f"This role will be DM'd during Alpha (Level 3) threats.",
         ephemeral=True
     )
-# ============= LOGS COMMAND =============
 
-@bot.tree.command(name="test_db", description="Test database - shows partnership count")
-@app_commands.checks.has_permissions(administrator=True)
-async def test_db(interaction: discord.Interaction):
-    """Debug command to check database"""
+# ============= ROLE MANAGEMENT SYSTEM =============
+
+@bot.tree.command(name="promotion", description="Promote a user by giving them a role")
+@app_commands.checks.has_permissions(manage_roles=True)
+async def promotion(interaction: discord.Interaction, user: discord.Member, role: discord.Role, reason: str = "No reason provided"):
+    """Promote a user by giving them a role"""
     await interaction.response.defer(ephemeral=True)
     
-    # Check if partnerships table exists and count rows
-    if db.USE_POSTGRES:
-        pool = await db.get_pool()
-        async with pool.acquire() as conn:
-            count = await conn.fetchval('SELECT COUNT(*) FROM partnerships WHERE server_id = $1', interaction.guild.id)
-            all_partnerships = await conn.fetch('SELECT id, partner_server_name, status FROM partnerships WHERE server_id = $1', interaction.guild.id)
-    else:
-        async with db.aiosqlite.connect(db.DATABASE_PATH) as database:
-            async with database.execute('SELECT COUNT(*) FROM partnerships WHERE server_id = ?', (interaction.guild.id,)) as cursor:
-                count_row = await cursor.fetchone()
-                count = count_row[0] if count_row else 0
-            
-            database.row_factory = db.aiosqlite.Row
-            async with database.execute('SELECT id, partner_server_name, status FROM partnerships WHERE server_id = ?', (interaction.guild.id,)) as cursor:
-                all_partnerships = await cursor.fetchall()
-    
-    embed = discord.Embed(title="🔍 Database Test", color=discord.Color.blue())
-    embed.add_field(name="Total Partnerships", value=str(count), inline=False)
-    
-    if all_partnerships:
-        partnerships_str = "\n".join([f"ID: {p['id' if db.USE_POSTGRES else 0]}, Name: {p['partner_server_name' if db.USE_POSTGRES else 1]}, Status: {p['status' if db.USE_POSTGRES else 2]}" for p in all_partnerships[:5]])
-        embed.add_field(name="Partnerships", value=partnerships_str, inline=False)
-    
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="logs", description="View recent security logs")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def logs_command(interaction: discord.Interaction, count: int = 10):
-    """View recent security logs"""
-    await interaction.response.defer(ephemeral=True)
-    
-    if count > 25:
-        count = 25  # Limit to 25
-    
-    logs = await db.get_recent_logs(interaction.guild.id, count)
-    
-    if not logs:
-        await interaction.followup.send("No logs found.", ephemeral=True)
-        return
-    
-    embed = discord.Embed(
-        title=f"📜 Recent Security Logs",
-        description=f"Showing last {len(logs)} events",
-        color=discord.Color.blue()
-    )
-    
-    for log in logs:
-        user = bot.get_user(log['user_id']) if log.get('user_id') else None
-        user_mention = user.mention if user else f"User ID: {log.get('user_id')}"
-        
-        timestamp = log.get('timestamp', 'Unknown time')
-        if isinstance(timestamp, str):
-            timestamp_str = timestamp
-        else:
-            timestamp_str = timestamp.strftime('%Y-%m-%d %H:%M:%S') if timestamp else 'Unknown'
-        
-        embed.add_field(
-            name=f"{log['action_type']} - {timestamp_str}",
-            value=f"User: {user_mention}",
-            inline=False
-        )
-    
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-# ============= WHOIS COMMAND =============
-
-@bot.tree.command(name="whois", description="Show linked Roblox account for a user")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def whois_command(interaction: discord.Interaction, user: discord.Member):
-    """Show user's linked Roblox account"""
-    await interaction.response.defer(ephemeral=True)
-    
-    verification = await db.get_verification(interaction.guild.id, user.id)
-    
-    if not verification or not verification.get('verified'):
+    if role >= interaction.guild.me.top_role:
         await interaction.followup.send(
-            f"{user.mention} has not verified their Roblox account.",
+            f"❌ I cannot manage {role.mention} - it's higher than or equal to my highest role.",
             ephemeral=True
         )
         return
     
-    embed = discord.Embed(
-        title=f"🔍 User Info: {user.name}",
-        color=discord.Color.blue()
-    )
+    if role in user.roles:
+        await interaction.followup.send(
+            f"❌ {user.mention} already has the {role.mention} role.",
+            ephemeral=True
+        )
+        return
     
-    embed.add_field(name="Discord User", value=user.mention, inline=True)
-    embed.add_field(name="Discord ID", value=str(user.id), inline=True)
-    embed.add_field(name="Roblox Username", value=verification.get('roblox_username', 'Unknown'), inline=True)
-    embed.add_field(name="Roblox ID", value=str(verification.get('roblox_id', 'Unknown')), inline=True)
-    
-    verified_at = verification.get('verified_at', 'Unknown')
-    if verified_at and verified_at != 'Unknown':
-        if isinstance(verified_at, str):
-            embed.add_field(name="Verified At", value=verified_at, inline=True)
-        else:
-            embed.add_field(name="Verified At", value=verified_at.strftime('%Y-%m-%d %H:%M:%S'), inline=True)
-    
-    embed.set_thumbnail(url=user.display_avatar.url)
-    
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    try:
+        await user.add_roles(role, reason=f"Promoted by {interaction.user.name}: {reason}")
+        
+        await log_action(interaction.guild, 'promotion', 'User Promoted',
+                        interaction.user, f"{user.mention} given {role.mention}",
+                        extra_info={'User': user.name, 'Role': role.name, 'Reason': reason})
+        
+        try:
+            await user.send(
+                f"🎉 Congratulations! You've been promoted in **{interaction.guild.name}**!\n"
+                f"**Role Granted:** {role.name}\n"
+                f"**Promoted By:** {interaction.user.name}\n"
+                f"**Reason:** {reason}"
+            )
+        except:
+            pass
+        
+        await interaction.followup.send(
+            f"✅ Promoted {user.mention} to {role.mention}",
+            ephemeral=True
+        )
+        
+    except discord.Forbidden:
+        await interaction.followup.send(
+            f"❌ I don't have permission to manage roles.",
+            ephemeral=True
+        )
+    except Exception as e:
+        logger.error(f"Error promoting user: {e}")
+        await interaction.followup.send(
+            f"❌ Error promoting user: {str(e)}",
+            ephemeral=True
+        )
 
-# ============= BACKUP SYSTEM =============
-
-@bot.tree.command(name="backup_create", description="Create a backup of server structure")
-@app_commands.checks.has_permissions(administrator=True)
-async def backup_create(interaction: discord.Interaction):
-    """Create a manual backup of the server"""
+@bot.tree.command(name="demotion", description="Demote a user by removing a role")
+@app_commands.checks.has_permissions(manage_roles=True)
+async def demotion(interaction: discord.Interaction, user: discord.Member, role: discord.Role, reason: str = "No reason provided"):
+    """Demote a user by removing a role"""
     await interaction.response.defer(ephemeral=True)
     
-    guild = interaction.guild
+    if role >= interaction.guild.me.top_role:
+        await interaction.followup.send(
+            f"❌ I cannot manage {role.mention} - it's higher than or equal to my highest role.",
+            ephemeral=True
+        )
+        return
     
-    # Collect server data
-    backup_data = {
-        'guild_name': guild.name,
-        'guild_id': guild.id,
-        'channels': [],
-        'roles': [],
-        'created_at': datetime.now().isoformat()
-    }
+    if role not in user.roles:
+        await interaction.followup.send(
+            f"❌ {user.mention} doesn't have the {role.mention} role.",
+            ephemeral=True
+        )
+        return
     
-    # Backup channels
-    for channel in guild.channels:
-        channel_data = {
-            'name': channel.name,
-            'id': channel.id,
-            'type': str(channel.type),
-            'position': channel.position,
-        }
+    try:
+        await user.remove_roles(role, reason=f"Demoted by {interaction.user.name}: {reason}")
         
-        if isinstance(channel, discord.TextChannel):
-            channel_data['topic'] = channel.topic
-            channel_data['nsfw'] = channel.nsfw
-            channel_data['slowmode_delay'] = channel.slowmode_delay
+        await log_action(interaction.guild, 'demotion', 'User Demoted',
+                        interaction.user, f"{user.mention} removed from {role.mention}",
+                        extra_info={'User': user.name, 'Role': role.name, 'Reason': reason})
         
-        backup_data['channels'].append(channel_data)
-    
-    # Backup roles
-    for role in guild.roles:
-        if role.name != "@everyone":
-            role_data = {
-                'name': role.name,
-                'id': role.id,
-                'color': role.color.value,
-                'position': role.position,
-                'permissions': role.permissions.value,
-                'hoist': role.hoist,
-                'mentionable': role.mentionable
-            }
-            backup_data['roles'].append(role_data)
-    
-    # Save to database
-    backup_json = json.dumps(backup_data)
-    
-    if db.USE_POSTGRES:
-        pool = await db.get_pool()
-        async with pool.acquire() as conn:
-            backup_id = await conn.fetchval(
-                '''INSERT INTO backups (server_id, backup_data, backup_type)
-                   VALUES ($1, $2, $3) RETURNING backup_id''',
-                guild.id, backup_json, 'manual'
+        try:
+            await user.send(
+                f"📉 You've been demoted in **{interaction.guild.name}**.\n"
+                f"**Role Removed:** {role.name}\n"
+                f"**Demoted By:** {interaction.user.name}\n"
+                f"**Reason:** {reason}"
             )
-    else:
-        async with db.aiosqlite.connect(db.DATABASE_PATH) as database:
-            cursor = await database.execute(
-                '''INSERT INTO backups (server_id, backup_data, backup_type)
-                   VALUES (?, ?, ?)''',
-                (guild.id, backup_json, 'manual')
-            )
-            await database.commit()
-            backup_id = cursor.lastrowid
+        except:
+            pass
+        
+        await interaction.followup.send(
+            f"✅ Demoted {user.mention} - removed {role.mention}",
+            ephemeral=True
+        )
+        
+    except discord.Forbidden:
+        await interaction.followup.send(
+            f"❌ I don't have permission to manage roles.",
+            ephemeral=True
+        )
+    except Exception as e:
+        logger.error(f"Error demoting user: {e}")
+        await interaction.followup.send(
+            f"❌ Error demoting user: {str(e)}",
+            ephemeral=True
+        )
+
+@bot.tree.command(name="requestrole", description="Request a role from staff")
+async def requestrole(interaction: discord.Interaction, role: discord.Role, reason: str = "No reason provided"):
+    """Request a role"""
+    await interaction.response.defer(ephemeral=True)
     
-    embed = discord.Embed(
-        title="✅ Backup Created",
-        description=f"Server backup created successfully!",
-        color=discord.Color.green()
-    )
-    embed.add_field(name="Backup ID", value=str(backup_id), inline=True)
-    embed.add_field(name="Channels Backed Up", value=str(len(backup_data['channels'])), inline=True)
-    embed.add_field(name="Roles Backed Up", value=str(len(backup_data['roles'])), inline=True)
-    embed.set_footer(text=f"Use /backup_restore {backup_id} to restore")
+    if role >= interaction.guild.me.top_role:
+        await interaction.followup.send(
+            f"❌ You cannot request {role.mention} - it's an administrative role.",
+            ephemeral=True
+        )
+        return
     
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    if role in interaction.user.roles:
+        await interaction.followup.send(
+            f"❌ You already have the {role.mention} role.",
+            ephemeral=True
+        )
+        return
     
-    # Log backup creation
-    await db.add_log(
-        guild.id,
-        'backup_created',
+    request_id = await db.create_role_request(
+        interaction.guild.id,
         interaction.user.id,
-        details={'backup_id': backup_id, 'type': 'manual'}
+        interaction.user.name,
+        role.id,
+        reason
     )
-
-@bot.tree.command(name="backup_restore", description="Restore server from a backup")
-@app_commands.checks.has_permissions(administrator=True)
-async def backup_restore(interaction: discord.Interaction, backup_id: int):
-    """Restore server from a backup"""
-    await interaction.response.defer(ephemeral=True)
     
-    # Get backup from database
-    if db.USE_POSTGRES:
-        pool = await db.get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                'SELECT * FROM backups WHERE backup_id = $1 AND server_id = $2',
-                backup_id, interaction.guild.id
+    config = server_configs.get(interaction.guild.id, {})
+    log_channel_id = config.get('log_channel_id')
+    
+    if log_channel_id:
+        log_channel = interaction.guild.get_channel(log_channel_id)
+        if log_channel:
+            embed = discord.Embed(
+                title="📝 Role Request",
+                color=discord.Color.blue(),
+                timestamp=datetime.now()
             )
-    else:
-        async with db.aiosqlite.connect(db.DATABASE_PATH) as database:
-            database.row_factory = db.aiosqlite.Row
-            async with database.execute(
-                'SELECT * FROM backups WHERE backup_id = ? AND server_id = ?',
-                (backup_id, interaction.guild.id)
-            ) as cursor:
-                row = await cursor.fetchone()
-    
-    if not row:
-        await interaction.followup.send(
-            f"❌ Backup ID {backup_id} not found for this server.",
-            ephemeral=True
-        )
-        return
-    
-    backup_data = json.loads(row['backup_data'] if db.USE_POSTGRES else row[2])
+            embed.add_field(name="User", value=interaction.user.mention, inline=True)
+            embed.add_field(name="Role Requested", value=role.mention, inline=True)
+            embed.add_field(name="Reason", value=reason, inline=False)
+            embed.set_footer(text=f"Request ID: {request_id}")
+            
+            view = RoleRequestView(request_id)
+            await log_channel.send(embed=embed, view=view)
     
     await interaction.followup.send(
-        f"⚠️ **WARNING:** Restoring will recreate {len(backup_data['channels'])} channels and {len(backup_data['roles'])} roles.\n"
-        f"This action cannot be undone. Are you sure?\n\n"
-        f"**Note:** This is a basic restore - it recreates structure but not permissions/settings yet.",
+        f"✅ Role request submitted!\n"
+        f"**Role:** {role.mention}\n"
+        f"**Request ID:** {request_id}\n\n"
+        f"Staff will review your request shortly.",
         ephemeral=True
     )
     
-    # Log restore attempt
     await db.add_log(
         interaction.guild.id,
-        'backup_restore_attempted',
+        'role_request_submitted',
         interaction.user.id,
-        details={'backup_id': backup_id}
+        details={'role_id': role.id, 'role_name': role.name, 'request_id': request_id, 'reason': reason}
     )
 
-# Run the bot
-bot.run(TOKEN)
+class RoleRequestView(discord.ui.View):
+    def __init__(self, request_id):
+        super().__init__(timeout=None)
+        self.request_id = request_id
+    
+    @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.green, custom_id="role_approve")
+    async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.manage_roles:
+            await interaction.response.send_message(
+                "❌ You need 'Manage Roles' permission to approve role requests.",
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer()
+        
+        request = await db.get_role_request(self.request_id)
+        if not request:
+            await interaction.followup.send("❌ Request not found.", ephemeral=True)
+            return
+        
+        user = interaction.guild.get_member(request['user_id'])
+        role = interaction.guild.get_role(request['role_id'])
+        
+        if not user:
+            await interaction.followup.send("❌ User not found in server.", ephemeral=True)
+            return
+        
+        if not role:
+            await interaction.followup.send("❌ Role not found.", ephemeral=True)
+            return
+        
+        try:
+            await user.add_roles(role, reason=f"Role request approved by {interaction.user.name}")
+            
+            await db.update_role_request_status(self.request_id, 'approved', interaction.user.id)
+            
+            try:
+                await user.send(
+                    f"✅ Your role request has been **APPROVED**!\n"
+                    f"**Server:** {interaction.guild.name}\n"
+                    f"**Role:** {role.name}\n"
+                    f"**Approved By:** {interaction.user.name}"
+                )
+            except:
+                pass
+            
+            embed = interaction.message.embeds[0]
+            embed.color = discord.Color.green()
+            embed.title = "✅ Role Request Approved"
+            embed.add_field(name="Approved By", value=interaction.user.mention, inline=True)
+            
+            await interaction.message.edit(embed=embed, view=None)
+            
+            await db.add_log(
+                interaction.guild.id,
+                'role_request_approved',
+                interaction.user.id,
+                details={'role_id': role.id, 'request_id': self.request_id, 'target_user_id': user.id}
+            )
+            
+            await interaction.followup.send(f"✅ Role request approved! {user.mention} has been given {role.mention}", ephemeral=True)
+            
+        except discord.Forbidden:
+            await interaction.followup.send("❌ I don't have permission to manage roles.", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error approving role request: {e}")
+            await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+    
+    @discord.ui.button(label="❌ Deny", style=discord.ButtonStyle.red, custom_id="role_deny")
+    async def deny_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.manage_roles:
+            await interaction.response.send_message(
+                "❌ You need 'Manage Roles' permission to deny role requests.",
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer()
+        
+        request = await db.get_role_request(self.request_id)
+        if not request:
+            await interaction.followup.send("❌ Request not found.", ephemeral=True)
+            return
+        
+        user = interaction.guild.get_member(request['user_id'])
+        role = interaction.guild.get_role(request['role_id'])
+        
+        await db.update_role_request_status(self.request_id, 'denied', interaction.user.id)
+        
+        if user:
+            try:
+                await user.send(
+                    f"❌ Your role request has been **DENIED**.\n"
+                    f"**Server:** {interaction.guild.name}\n"
+                    f"**Role:** {role.name if role else 'Unknown'}\n"
+                    f"**Denied By:** {interaction.user.name}"
+                )
+            except:
+                pass
+        
+        embed = interaction.message.embeds[0]
+        embed.color = discord.Color.red()
+        embed.title = "❌ Role Request Denied"
+        embed.add_field(name="Denied By", value=interaction.user.mention, inline=True)
+        
+        await interaction.message.edit(embed=embed, view=None)
+        
+        await db.add_log(
+            interaction.guild.id,
+            'role_request_denied',
+            interaction.user.id,
+            details={'role_id': request['role_id'], 'request_id': self.request_id, 'target_user_id': request['user_id']}
+        )
+        
+        await interaction.followup.send("❌ Role request denied.", ephemeral=True)
+
+# ============= ROLE REQUESTS CONTINUATION =============
+
+@bot.tree.command(name="role_requests", description="View all pending role requests")
+@app_commands.checks.has_permissions(manage_roles=True)
+async def role_requests(interaction: discord.Interaction):
+    """View all pending role requests"""
+    await interaction.response.defer(ephemeral=True)
+    
+    pending_requests = await db.get_pending_role_requests(interaction.guild.id)
+    
+    if not pending_requests:
+        await interaction.followup.send("✅ No pending role requests.", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title="📝 Pending Role Requests",
+        color=discord.Color.blue(),
+        timestamp=datetime.now()
+    )
+    
+    for request in pending_requests[:10]:
+        user = bot.get_user(request['user_id'])
+        role = interaction.guild.get_role(request['role_id'])
+        
+        embed.add_field(
+            name=f"Request ID: {request['id']}",
+            value=(
+                f"**User:** {user.mention if user else f'ID: {request['user_id']}'}\n"
+                f"**Role:** {role.mention if role else f'ID: {request['role_id']}'}\n"
+                f"**Reason:** {request.get('reason', 'No reason provided')}"
+            ),
+            inline=False
+        )
+    
+    embed.set_footer(text=f"Showing {min(10, len(pending_requests))} of {len(pending_requests)} requests")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+# ============= LOG CHANNEL SETUP =============
+
+@bot.tree.command(name="set_log_channel", description="Set the security log channel")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    """Set where security alerts are logged"""
+    await interaction.response.defer(ephemeral=True)
+    
+    await db.update_server_field(interaction.guild.id, 'log_channel_id', channel.id)
+    
+    if interaction.guild.id not in server_configs:
+        server_configs[interaction.guild.id] = {}
+    server_configs[interaction.guild.id]['log_channel_id'] = channel.id
+    
+    embed = discord.Embed(
+        title="✅ Log Channel Set",
+        description=f"Security alerts will be sent to {channel.mention}",
+        color=discord.Color.green()
+    )
+    
+    await interaction.followup.send(embed=embed, ephemeral=True)
+    
+    try:
+        test_embed = discord.Embed(
+            title="🧪 Test Message",
+            description="Log channel configured successfully!",
+            color=discord.Color.green(),
+            timestamp=datetime.now()
+        )
+        await channel.send(embed=test_embed)
+    except Exception as e:
+        logger.warning(f"Could not send test message to log channel: {e}")
+
+@bot.tree.command(name="set_partnership_channel", description="Set the partnership/whitelist channel")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_partnership_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    """Set partnership channel for server collaboration"""
+    await interaction.response.defer(ephemeral=True)
+    
+    await db.update_server_field(interaction.guild.id, 'partnership_channel_id', channel.id)
+    
+    if interaction.guild.id not in server_configs:
+        server_configs[interaction.guild.id] = {}
+    server_configs[interaction.guild.id]['partnership_channel_id'] = channel.id
+    
+    await interaction.followup.send(
+        f"✅ Partnership channel set to {channel.mention}\n"
+        f"Use `/partnership_add` to add partner servers.",
+        ephemeral=True
+    )
+
+# ============= PARTNERSHIP SYSTEM =============
+
+@bot.tree.command(name="partnership_add", description="Add a partner server to whitelist")
+@app_commands.checks.has_permissions(administrator=True)
+async def partnership_add(interaction: discord.Interaction, server_id: str, server_name: str, contact: str = "Not provided"):
+    """Add a partner server"""
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        server_id_int = int(server_id)
+    except ValueError:
+        await interaction.followup.send("❌ Invalid server ID. Must be a number.", ephemeral=True)
+        return
+    
+    partnership_id = await db.create_partnership(
+        interaction.guild.id,
+        server_id_int,
+        server_name,
+        contact,
+        interaction.user.id
+    )
+    
+    config = server_configs.get(interaction.guild.id, {})
+    partnership_channel_id = config.get('partnership_channel_id')
+    
+    if partnership_channel_id:
+        channel = interaction.guild.get_channel(partnership_channel_id)
+        if channel:
+            embed = discord.Embed(
+                title="🤝 New Partnership",
+                color=discord.Color.blue(),
+                timestamp=datetime.now()
+            )
+            embed.add_field(name="Server Name", value=server_name, inline=True)
+            embed.add_field(name="Server ID", value=server_id, inline=True)
+            embed.add_field(name="Contact", value=contact, inline=True)
+            embed.add_field(name="Added By", value=interaction.user.mention, inline=True)
+            
+            try:
+                await channel.send(embed=embed)
+            except Exception as e:
+                logger.warning(f"Could not send partnership announcement: {e}")
+    
+    await interaction.followup.send(
+        f"✅ Partnership added!\n"
+        f"**Server:** {server_name}\n"
+        f"**Server ID:** {server_id}\n"
+        f"**Partnership ID:** {partnership_id}",
+        ephemeral=True
+    )
+    
+    await db.add_log(
+        interaction.guild.id,
+        'partnership_added',
+        interaction.user.id,
+        details={'partnership_id': partnership_id, 'server_name': server_name, 'server_id': server_id_int}
+    )
+
+@bot.tree.command(name="partnership_remove", description="Remove a partner server")
+@app_commands.checks.has_permissions(administrator=True)
+async def partnership_remove(interaction: discord.Interaction, partnership_id: int):
+    """Remove a partnership"""
+    await interaction.response.defer(ephemeral=True)
+    
+    partnership = await db.get_partnership(partnership_id)
+    
+    if not partnership:
+        await interaction.followup.send("❌ Partnership not found.", ephemeral=True)
+        return
+    
+    if partnership['guild_id'] != interaction.guild.id:
+        await interaction.followup.send("❌ This partnership doesn't belong to your server.", ephemeral=True)
+        return
+    
+    await db.delete_partnership(partnership_id)
+    
+    await interaction.followup.send(
+        f"✅ Partnership removed: {partnership['partner_server_name']}",
+        ephemeral=True
+    )
+    
+    await db.add_log(
+        interaction.guild.id,
+        'partnership_removed',
+        interaction.user.id,
+        details={'partnership_id': partnership_id, 'server_name': partnership['partner_server_name']}
+    )
+
+@bot.tree.command(name="partnerships", description="View all partner servers")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def partnerships(interaction: discord.Interaction):
+    """View all partnerships"""
+    await interaction.response.defer(ephemeral=True)
+    
+    partnerships_list = await db.get_partnerships(interaction.guild.id)
+    
+    if not partnerships_list:
+        await interaction.followup.send("❌ No partnerships yet. Use `/partnership_add` to add one.", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title="🤝 Partner Servers",
+        color=discord.Color.blue(),
+        timestamp=datetime.now()
+    )
+    
+    display_count = min(MAX_PARTNERSHIPS_DISPLAY, len(partnerships_list))
+    
+    for partnership in partnerships_list[:MAX_PARTNERSHIPS_DISPLAY]:
+        embed.add_field(
+            name=f"{partnership['partner_server_name']} (ID: {partnership['id']})",
+            value=(
+                f"**Server ID:** {partnership['partner_server_id']}\n"
+                f"**Contact:** {partnership['contact']}\n"
+                f"**Added By:** <@{partnership['added_by']}>"
+            ),
+            inline=False
+        )
+    
+    if len(partnerships_list) > MAX_PARTNERSHIPS_DISPLAY:
+        embed.set_footer(text=f"Showing {display_count} of {len(partnerships_list)} partnerships")
+    else:
+        embed.set_footer(text=f"Total: {len(partnerships_list)} partnership(s)")
+    
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+# ============= ADMIN COMMANDS =============
+
+@bot.tree.command(name="logs", description="View recent server logs")
+@app_commands.checks.has_permissions(administrator=True)
+async def logs(interaction: discord.Interaction, limit: int = 10):
+    """View recent server logs"""
+    await interaction.response.defer(ephemeral=True)
+    
+    if limit < 1 or limit > 50:
+        await interaction.followup.send("❌ Limit must be between 1 and 50.", ephemeral=True)
+        return
+    
+    guild_logs = await db.get_logs(interaction.guild.id, limit)
+    
+    if not guild_logs:
+        await interaction.followup.send("❌ No logs found.", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title="📋 Recent Server Logs",
+        color=discord.Color.blue(),
+        timestamp=datetime.now()
+    )
+    
+    for log in guild_logs:
+        user_mention = f"<@{log['user_id']}>" if log['user_id'] else "System"
+        timestamp = log.get('timestamp', 'Unknown')
+        
+        if isinstance(timestamp, str):
+            timestamp_str = timestamp
+        else:
+            timestamp_str = timestamp.strftime('%Y-%m-%d %H:%M:%S') if hasattr(timestamp, 'strftime') else str(timestamp)
+        
+        log_text = f"**Type:** {log['log_type']}\n**User:** {user_mention}\n**Time:** {timestamp_str}"
+        
+        if log.get('details'):
+            details = log['details']
+            if isinstance(details, dict):
+                for key, value in list(details.items())[:3]:
+                    log_text += f"\n**{key}:** {str(value)[:100]}"
+        
+        embed.add_field(name=f"Log #{log['id']}", value=log_text, inline=False)
+    
+    embed.set_footer(text=f"Showing {len(guild_logs)} log(s)")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="config", description="View server configuration")
+@app_commands.checks.has_permissions(administrator=True)
+async def config(interaction: discord.Interaction):
+    """View server configuration"""
+    await interaction.response.defer(ephemeral=True)
+    
+    config = server_configs.get(interaction.guild.id, {})
+    
+    embed = discord.Embed(
+        title="⚙️ Server Configuration",
+        color=discord.Color.blue(),
+        timestamp=datetime.now()
+    )
+    
+    security_config = {
+        'Log Channel': f"<#{config.get('log_channel_id')}>" if config.get('log_channel_id') else "Not set",
+        'Quarantine Role': f"<@&{config.get('quarantine_role_id')}>" if config.get('quarantine_role_id') else "Not set",
+        'Verified Role': f"<@&{config.get('verified_role_id')}>" if config.get('verified_role_id') else "Not set",
+        'Unverified Role': f"<@&{config.get('unverified_role_id')}>" if config.get('unverified_role_id') else "Not set",
+    }
+    
+    for key, value in security_config.items():
+        embed.add_field(name=key, value=value, inline=True)
+    
+    features = {
+        'Verification Enabled': "✅ Yes" if config.get('verification_enabled') else "❌ No",
+        'Lockdown Active': "🔒 Yes" if config.get('lockdown_enabled') else "🔓 No",
+    }
+    
+    for key, value in features.items():
+        embed.add_field(name=key, value=value, inline=True)
+    
+    staff_roles = {
+        'On-Duty Role': f"<@&{config.get('onduty_role_id')}>" if config.get('onduty_role_id') else "Not set",
+        'All Staff Role': f"<@&{config.get('allstaff_role_id')}>" if config.get('allstaff_role_id') else "Not set",
+    }
+    
+    for key, value in staff_roles.items():
+        embed.add_field(name=key, value=value, inline=True)
+    
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="reset_config", description="Reset server configuration")
+@app_commands.checks.has_permissions(administrator=True)
+async def reset_config(interaction: discord.Interaction):
+    """Reset server configuration"""
+    await interaction.response.send_message(
+        "⚠️ Are you sure you want to reset all configuration?\n"
+        "This will clear all settings. React with ✅ to confirm or ❌ to cancel.",
+        ephemeral=True
+    )
+    
+    def check(reaction, user):
+        return user == interaction.user
+    
+    try:
+        reaction, _ = await bot.wait_for('reaction_add', timeout=30.0, check=check)
+        
+        if str(reaction.emoji) == '✅':
+            await db.reset_server_config(interaction.guild.id)
+            if interaction.guild.id in server_configs:
+                server_configs[interaction.guild.id] = {}
+            
+            await interaction.followup.send("✅ Configuration reset!", ephemeral=True)
+        else:
+            await interaction.followup.send("❌ Reset cancelled.", ephemeral=True)
+    except asyncio.TimeoutError:
+        await interaction.followup.send("❌ Reset cancelled (timeout).", ephemeral=True)
+
+# ============= BOT RUN =============
+
+if __name__ == "__main__":
+    try:
+        bot.run(TOKEN)
+    except Exception as e:
+        logger.error(f"Failed to start bot: {e}")
