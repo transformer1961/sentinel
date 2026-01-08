@@ -1,29 +1,26 @@
-import sqlite3
-import asyncio
-import json
+"""
+SENTINEL SECURITY BOT v2.0 - DATABASE MODULE
+Complete database operations for all bot features
+"""
+
+import aiosqlite
 import logging
-from datetime import datetime
 from typing import Optional, List, Dict, Any
+from datetime import datetime, timedelta
+from collections import defaultdict
 
 logger = logging.getLogger('SecurityBot.Database')
 
-# Database file path
-DATABASE_FILE = 'security_bot.db'
+DATABASE_PATH = 'sentinel_security.db'
 
-# ============= DATABASE INITIALIZATION =============
+# ============= INITIALIZATION =============
 
 async def init_database():
-    """Initialize the database with all required tables"""
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        
-        # Enable foreign keys
-        cursor.execute('PRAGMA foreign_keys = ON')
-        
-        # Server Configurations Table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS server_configs (
+    """Initialize all database tables"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        # Server configurations
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS server_config (
                 guild_id INTEGER PRIMARY KEY,
                 log_channel_id INTEGER,
                 quarantine_role_id INTEGER,
@@ -32,71 +29,164 @@ async def init_database():
                 verification_channel_id INTEGER,
                 verification_enabled BOOLEAN DEFAULT 0,
                 lockdown_enabled BOOLEAN DEFAULT 0,
-                partnership_channel_id INTEGER,
                 onduty_role_id INTEGER,
                 allstaff_role_id INTEGER,
+                daily_reports_enabled BOOLEAN DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
-        # Whitelist Table
-        cursor.execute('''
+        # Whitelists
+        await db.execute('''
             CREATE TABLE IF NOT EXISTS whitelist (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id INTEGER NOT NULL,
                 user_id INTEGER NOT NULL,
-                whitelist_type TEXT DEFAULT 'user',
+                entity_type TEXT DEFAULT 'user',
                 added_by INTEGER,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(guild_id, user_id),
-                FOREIGN KEY (guild_id) REFERENCES server_configs(guild_id)
+                UNIQUE(guild_id, user_id)
             )
         ''')
         
-        # Logs Table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS logs (
+        # Threat levels
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS threat_levels (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id INTEGER NOT NULL,
-                log_type TEXT NOT NULL,
-                user_id INTEGER,
-                details TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (guild_id) REFERENCES server_configs(guild_id)
+                threat_level INTEGER NOT NULL,
+                set_by INTEGER,
+                set_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
-        # User Emails Table
-        cursor.execute('''
+        # Activity logs
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS activity_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                user_id INTEGER,
+                details TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # User emails
+        await db.execute('''
             CREATE TABLE IF NOT EXISTS user_emails (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id INTEGER NOT NULL,
                 user_id INTEGER NOT NULL,
                 email TEXT NOT NULL,
                 verified BOOLEAN DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(guild_id, user_id),
-                FOREIGN KEY (guild_id) REFERENCES server_configs(guild_id)
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(guild_id, user_id)
             )
         ''')
         
-        # Quarantine Roles Storage Table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS quarantine_roles (
+        # Shifts
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS shifts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id INTEGER NOT NULL,
                 user_id INTEGER NOT NULL,
-                role_ids TEXT NOT NULL,
-                quarantined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(guild_id, user_id),
-                FOREIGN KEY (guild_id) REFERENCES server_configs(guild_id)
+                department TEXT,
+                callsign TEXT,
+                start_time TIMESTAMP NOT NULL,
+                end_time TIMESTAMP,
+                duration_seconds INTEGER,
+                force_ended BOOLEAN DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
-        # Verification Table
-        cursor.execute('''
+        # Departments
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS departments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                department_head INTEGER,
+                role_id INTEGER,
+                suspended BOOLEAN DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(guild_id, name)
+            )
+        ''')
+        
+        # Department members
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS department_members (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                department TEXT NOT NULL,
+                status TEXT DEFAULT 'member',
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(guild_id, user_id, department)
+            )
+        ''')
+        
+        # Department join requests
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS department_join_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                department TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                reason TEXT,
+                requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                processed_at TIMESTAMP,
+                processed_by INTEGER
+            )
+        ''')
+        
+        # Role requests
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS role_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                role_id INTEGER NOT NULL,
+                status TEXT DEFAULT 'pending',
+                requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                processed_at TIMESTAMP,
+                processed_by INTEGER
+            )
+        ''')
+        
+        # Partnerships
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS partnerships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                partner_guild_id INTEGER NOT NULL,
+                guild_name TEXT NOT NULL,
+                description TEXT,
+                added_by INTEGER,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(guild_id, partner_guild_id)
+            )
+        ''')
+        
+        # Member tiers
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS member_tiers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                tier INTEGER DEFAULT 1,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(guild_id, user_id)
+            )
+        ''')
+        
+        # Verifications (Roblox)
+        await db.execute('''
             CREATE TABLE IF NOT EXISTS verifications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id INTEGER NOT NULL,
@@ -107,484 +197,684 @@ async def init_database():
                 verified BOOLEAN DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 verified_at TIMESTAMP,
-                UNIQUE(guild_id, user_id),
-                FOREIGN KEY (guild_id) REFERENCES server_configs(guild_id)
+                UNIQUE(guild_id, user_id)
             )
         ''')
         
-        # Role Requests Table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS role_requests (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                username TEXT NOT NULL,
-                role_id INTEGER NOT NULL,
-                reason TEXT,
-                status TEXT DEFAULT 'pending',
-                reviewed_by INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                reviewed_at TIMESTAMP,
-                FOREIGN KEY (guild_id) REFERENCES server_configs(guild_id)
-            )
-        ''')
+        await db.commit()
+        logger.info("✅ Database initialized successfully")
+
+# ============= SERVER CONFIG =============
+
+async def get_server_config(guild_id: int) -> Optional[Dict[str, Any]]:
+    """Get server configuration"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            'SELECT * FROM server_config WHERE guild_id = ?',
+            (guild_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+async def set_server_config(guild_id: int, **kwargs):
+    """Set server configuration fields"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        fields = ', '.join(f"{k} = ?" for k in kwargs.keys())
+        values = list(kwargs.values()) + [guild_id]
         
-        # Partnerships Table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS partnerships (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id INTEGER NOT NULL,
-                partner_guild_id INTEGER NOT NULL,
-                partner_server_name TEXT NOT NULL,
-                contact TEXT,
-                added_by INTEGER NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (guild_id) REFERENCES server_configs(guild_id)
-            )
-        ''')
+        await db.execute(f'''
+            INSERT INTO server_config (guild_id, {', '.join(kwargs.keys())})
+            VALUES (?, {', '.join('?' * len(kwargs))})
+            ON CONFLICT(guild_id) DO UPDATE SET {fields}, updated_at = CURRENT_TIMESTAMP
+        ''', [guild_id] + list(kwargs.values()) + values[:-1])
         
-        # Threat Levels Table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS threat_levels (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id INTEGER NOT NULL,
-                threat_level INTEGER DEFAULT 0,
-                reason TEXT,
-                set_by INTEGER,
-                set_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(guild_id),
-                FOREIGN KEY (guild_id) REFERENCES server_configs(guild_id)
-            )
-        ''')
-        
-        # Create indexes for faster queries
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_guild ON logs(guild_id)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_type ON logs(log_type)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_whitelist_guild ON whitelist(guild_id)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_verifications_guild ON verifications(guild_id)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_role_requests_guild ON role_requests(guild_id)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_partnerships_guild ON partnerships(guild_id)')
-        
-        conn.commit()
-        conn.close()
-        logger.info('✅ Database initialized successfully')
-        return True
-    except Exception as e:
-        logger.error(f'Database initialization error: {e}')
-        return False
+        await db.commit()
 
-# ============= HELPER FUNCTION =============
+async def update_server_field(guild_id: int, field: str, value: Any):
+    """Update a single server config field"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(f'''
+            INSERT INTO server_config (guild_id, {field})
+            VALUES (?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET {field} = ?, updated_at = CURRENT_TIMESTAMP
+        ''', (guild_id, value, value))
+        await db.commit()
 
-def _execute_query(query: str, params: tuple = (), fetch_one: bool = False, fetch_all: bool = False):
-    """Execute a database query synchronously"""
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute(query, params)
-        
-        if fetch_one:
-            result = cursor.fetchone()
-            conn.close()
-            return dict(result) if result else None
-        elif fetch_all:
-            results = cursor.fetchall()
-            conn.close()
-            return [dict(row) for row in results]
-        else:
-            conn.commit()
-            conn.close()
-            return cursor.lastrowid
-    except Exception as e:
-        logger.error(f'Database error: {e}')
-        return None
-
-async def execute_query(query: str, params: tuple = (), fetch_one: bool = False, fetch_all: bool = False):
-    """Execute a database query asynchronously"""
-    return await asyncio.to_thread(_execute_query, query, params, fetch_one, fetch_all)
-
-# ============= SERVER CONFIGURATION =============
-
-async def load_all_configs() -> dict:
-    """Load all server configurations"""
-    results = await execute_query('SELECT * FROM server_configs', fetch_all=True)
-    return {row['guild_id']: row for row in (results or [])}
-
-async def set_server_config(guild_id: int, **kwargs) -> bool:
-    """Set server configuration"""
-    try:
-        # Check if config exists
-        existing = await execute_query(
-            'SELECT guild_id FROM server_configs WHERE guild_id = ?',
-            (guild_id,),
-            fetch_one=True
-        )
-        
-        if existing:
-            # Update existing
-            set_clause = ', '.join([f'{key} = ?' for key in kwargs.keys()])
-            query = f'UPDATE server_configs SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE guild_id = ?'
-            await execute_query(query, tuple(kwargs.values()) + (guild_id,))
-        else:
-            # Insert new
-            keys = ', '.join(['guild_id'] + list(kwargs.keys()))
-            placeholders = ', '.join(['?'] * (len(kwargs) + 1))
-            query = f'INSERT INTO server_configs ({keys}) VALUES ({placeholders})'
-            await execute_query(query, (guild_id,) + tuple(kwargs.values()))
-        
-        return True
-    except Exception as e:
-        logger.error(f'Error setting server config: {e}')
-        return False
-
-async def update_server_field(guild_id: int, field: str, value: Any) -> bool:
-    """Update a single server configuration field"""
-    try:
-        query = f'UPDATE server_configs SET {field} = ?, updated_at = CURRENT_TIMESTAMP WHERE guild_id = ?'
-        await execute_query(query, (value, guild_id))
-        return True
-    except Exception as e:
-        logger.error(f'Error updating server field: {e}')
-        return False
-
-async def reset_server_config(guild_id: int) -> bool:
-    """Reset server configuration"""
-    try:
-        await execute_query('DELETE FROM server_configs WHERE guild_id = ?', (guild_id,))
-        return True
-    except Exception as e:
-        logger.error(f'Error resetting config: {e}')
-        return False
-
-# ============= LOGGING =============
-
-async def add_log(guild_id: int, log_type: str, user_id: Optional[int] = None, details: Optional[dict] = None) -> bool:
-    """Add a log entry"""
-    try:
-        details_json = json.dumps(details) if details else None
-        query = 'INSERT INTO logs (guild_id, log_type, user_id, details) VALUES (?, ?, ?, ?)'
-        await execute_query(query, (guild_id, log_type, user_id, details_json))
-        return True
-    except Exception as e:
-        logger.error(f'Error adding log: {e}')
-        return False
-
-async def get_logs(guild_id: int, limit: int = 10) -> List[dict]:
-    """Get recent logs for a guild"""
-    try:
-        query = '''
-            SELECT id, guild_id, log_type, user_id, details, timestamp 
-            FROM logs 
-            WHERE guild_id = ? 
-            ORDER BY timestamp DESC 
-            LIMIT ?
-        '''
-        results = await execute_query(query, (guild_id, limit), fetch_all=True)
-        
-        # Parse JSON details
-        for log in (results or []):
-            if log['details']:
-                log['details'] = json.loads(log['details'])
-        
-        return results or []
-    except Exception as e:
-        logger.error(f'Error getting logs: {e}')
-        return []
+async def load_all_configs() -> Dict[int, Dict[str, Any]]:
+    """Load all server configs"""
+    configs = {}
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute('SELECT * FROM server_config') as cursor:
+            async for row in cursor:
+                configs[row['guild_id']] = dict(row)
+    return configs
 
 # ============= WHITELIST =============
 
-async def load_all_whitelists() -> dict:
-    """Load all whitelists"""
-    try:
-        results = await execute_query('SELECT guild_id, user_id FROM whitelist', fetch_all=True)
-        whitelists = {}
-        for row in (results or []):
-            guild_id = row['guild_id']
-            if guild_id not in whitelists:
-                whitelists[guild_id] = set()
-            whitelists[guild_id].add(row['user_id'])
-        return whitelists
-    except Exception as e:
-        logger.error(f'Error loading whitelists: {e}')
-        return {}
-
-async def is_whitelisted(guild_id: int, user_id: int) -> bool:
-    """Check if user is whitelisted"""
-    try:
-        result = await execute_query(
-            'SELECT id FROM whitelist WHERE guild_id = ? AND user_id = ?',
-            (guild_id, user_id),
-            fetch_one=True
-        )
-        return result is not None
-    except Exception as e:
-        logger.error(f'Error checking whitelist: {e}')
-        return False
-
-async def add_to_whitelist(guild_id: int, user_id: int, whitelist_type: str = 'user', added_by: Optional[int] = None) -> bool:
+async def add_to_whitelist(guild_id: int, user_id: int, entity_type: str = 'user', added_by: int = None):
     """Add user to whitelist"""
-    try:
-        query = 'INSERT OR IGNORE INTO whitelist (guild_id, user_id, whitelist_type, added_by) VALUES (?, ?, ?, ?)'
-        await execute_query(query, (guild_id, user_id, whitelist_type, added_by))
-        return True
-    except Exception as e:
-        logger.error(f'Error adding to whitelist: {e}')
-        return False
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            INSERT OR IGNORE INTO whitelist (guild_id, user_id, entity_type, added_by)
+            VALUES (?, ?, ?, ?)
+        ''', (guild_id, user_id, entity_type, added_by))
+        await db.commit()
 
 async def remove_from_whitelist(guild_id: int, user_id: int) -> bool:
     """Remove user from whitelist"""
-    try:
-        await execute_query('DELETE FROM whitelist WHERE guild_id = ? AND user_id = ?', (guild_id, user_id))
-        return True
-    except Exception as e:
-        logger.error(f'Error removing from whitelist: {e}')
-        return False
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute('''
+            DELETE FROM whitelist WHERE guild_id = ? AND user_id = ?
+        ''', (guild_id, user_id))
+        await db.commit()
+        return cursor.rowcount > 0
 
-# ============= USER EMAILS =============
+async def is_whitelisted(guild_id: int, user_id: int) -> bool:
+    """Check if user is whitelisted"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        async with db.execute('''
+            SELECT 1 FROM whitelist WHERE guild_id = ? AND user_id = ?
+        ''', (guild_id, user_id)) as cursor:
+            return await cursor.fetchone() is not None
 
-async def set_user_email(guild_id: int, user_id: int, email: str) -> bool:
-    """Set user email for notifications"""
-    try:
-        query = '''
-            INSERT INTO user_emails (guild_id, user_id, email) 
-            VALUES (?, ?, ?)
-            ON CONFLICT(guild_id, user_id) DO UPDATE SET email = ?, updated_at = CURRENT_TIMESTAMP
-        '''
-        await execute_query(query, (guild_id, user_id, email, email))
-        return True
-    except Exception as e:
-        logger.error(f'Error setting user email: {e}')
-        return False
-
-async def get_user_email(guild_id: int, user_id: int) -> Optional[str]:
-    """Get user email"""
-    try:
-        result = await execute_query(
-            'SELECT email FROM user_emails WHERE guild_id = ? AND user_id = ?',
-            (guild_id, user_id),
-            fetch_one=True
-        )
-        return result['email'] if result else None
-    except Exception as e:
-        logger.error(f'Error getting user email: {e}')
-        return None
-
-async def remove_user_email(guild_id: int, user_id: int) -> bool:
-    """Remove user email"""
-    try:
-        await execute_query('DELETE FROM user_emails WHERE guild_id = ? AND user_id = ?', (guild_id, user_id))
-        return True
-    except Exception as e:
-        logger.error(f'Error removing user email: {e}')
-        return False
-
-# ============= QUARANTINE =============
-
-async def store_quarantine_roles(guild_id: int, user_id: int, role_ids: List[int]) -> bool:
-    """Store roles before quarantine"""
-    try:
-        role_ids_json = json.dumps(role_ids)
-        query = '''
-            INSERT INTO quarantine_roles (guild_id, user_id, role_ids)
-            VALUES (?, ?, ?)
-            ON CONFLICT(guild_id, user_id) DO UPDATE SET role_ids = ?, quarantined_at = CURRENT_TIMESTAMP
-        '''
-        await execute_query(query, (guild_id, user_id, role_ids_json, role_ids_json))
-        return True
-    except Exception as e:
-        logger.error(f'Error storing quarantine roles: {e}')
-        return False
-
-async def get_quarantine_roles(guild_id: int, user_id: int) -> List[int]:
-    """Get stored quarantine roles"""
-    try:
-        result = await execute_query(
-            'SELECT role_ids FROM quarantine_roles WHERE guild_id = ? AND user_id = ?',
-            (guild_id, user_id),
-            fetch_one=True
-        )
-        if result and result['role_ids']:
-            return json.loads(result['role_ids'])
-        return []
-    except Exception as e:
-        logger.error(f'Error getting quarantine roles: {e}')
-        return []
-
-# ============= VERIFICATION =============
-
-async def create_verification(guild_id: int, user_id: int, verification_code: str) -> bool:
-    """Create a new verification entry"""
-    try:
-        query = '''
-            INSERT INTO verifications (guild_id, user_id, verification_code)
-            VALUES (?, ?, ?)
-            ON CONFLICT(guild_id, user_id) DO UPDATE SET verification_code = ?, created_at = CURRENT_TIMESTAMP
-        '''
-        await execute_query(query, (guild_id, user_id, verification_code, verification_code))
-        return True
-    except Exception as e:
-        logger.error(f'Error creating verification: {e}')
-        return False
-
-async def get_verification(guild_id: int, user_id: int) -> Optional[dict]:
-    """Get verification entry"""
-    try:
-        result = await execute_query(
-            'SELECT * FROM verifications WHERE guild_id = ? AND user_id = ?',
-            (guild_id, user_id),
-            fetch_one=True
-        )
-        return result
-    except Exception as e:
-        logger.error(f'Error getting verification: {e}')
-        return None
-
-async def complete_verification(guild_id: int, user_id: int, roblox_id: int, roblox_username: str) -> bool:
-    """Mark verification as complete"""
-    try:
-        query = '''
-            UPDATE verifications 
-            SET verified = 1, roblox_id = ?, roblox_username = ?, verified_at = CURRENT_TIMESTAMP
-            WHERE guild_id = ? AND user_id = ?
-        '''
-        await execute_query(query, (roblox_id, roblox_username, guild_id, user_id))
-        return True
-    except Exception as e:
-        logger.error(f'Error completing verification: {e}')
-        return False
-
-# ============= ROLE REQUESTS =============
-
-async def create_role_request(guild_id: int, user_id: int, username: str, role_id: int, reason: str) -> Optional[int]:
-    """Create a role request"""
-    try:
-        query = '''
-            INSERT INTO role_requests (guild_id, user_id, username, role_id, reason)
-            VALUES (?, ?, ?, ?, ?)
-        '''
-        request_id = await execute_query(query, (guild_id, user_id, username, role_id, reason))
-        return request_id
-    except Exception as e:
-        logger.error(f'Error creating role request: {e}')
-        return None
-
-async def get_role_request(request_id: int) -> Optional[dict]:
-    """Get a role request"""
-    try:
-        result = await execute_query(
-            'SELECT * FROM role_requests WHERE id = ?',
-            (request_id,),
-            fetch_one=True
-        )
-        return result
-    except Exception as e:
-        logger.error(f'Error getting role request: {e}')
-        return None
-
-async def get_pending_role_requests(guild_id: int) -> List[dict]:
-    """Get all pending role requests"""
-    try:
-        results = await execute_query(
-            'SELECT * FROM role_requests WHERE guild_id = ? AND status = ? ORDER BY created_at DESC',
-            (guild_id, 'pending'),
-            fetch_all=True
-        )
-        return results or []
-    except Exception as e:
-        logger.error(f'Error getting pending role requests: {e}')
-        return []
-
-async def update_role_request_status(request_id: int, status: str, reviewed_by: int) -> bool:
-    """Update role request status"""
-    try:
-        query = '''
-            UPDATE role_requests 
-            SET status = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        '''
-        await execute_query(query, (status, reviewed_by, request_id))
-        return True
-    except Exception as e:
-        logger.error(f'Error updating role request status: {e}')
-        return False
-
-# ============= PARTNERSHIPS =============
-
-async def create_partnership(guild_id: int, partner_guild_id: int, partner_server_name: str, contact: str, added_by: int) -> Optional[int]:
-    """Create a partnership"""
-    try:
-        query = '''
-            INSERT INTO partnerships (guild_id, partner_guild_id, partner_server_name, contact, added_by)
-            VALUES (?, ?, ?, ?, ?)
-        '''
-        partnership_id = await execute_query(query, (guild_id, partner_guild_id, partner_server_name, contact, added_by))
-        return partnership_id
-    except Exception as e:
-        logger.error(f'Error creating partnership: {e}')
-        return None
-
-async def get_partnership(partnership_id: int) -> Optional[dict]:
-    """Get a partnership"""
-    try:
-        result = await execute_query(
-            'SELECT * FROM partnerships WHERE id = ?',
-            (partnership_id,),
-            fetch_one=True
-        )
-        return result
-    except Exception as e:
-        logger.error(f'Error getting partnership: {e}')
-        return None
-
-async def get_partnerships(guild_id: int) -> List[dict]:
-    """Get all partnerships for a guild"""
-    try:
-        results = await execute_query(
-            'SELECT * FROM partnerships WHERE guild_id = ? ORDER BY created_at DESC',
-            (guild_id,),
-            fetch_all=True
-        )
-        return results or []
-    except Exception as e:
-        logger.error(f'Error getting partnerships: {e}')
-        return []
-
-async def delete_partnership(partnership_id: int) -> bool:
-    """Delete a partnership"""
-    try:
-        await execute_query('DELETE FROM partnerships WHERE id = ?', (partnership_id,))
-        return True
-    except Exception as e:
-        logger.error(f'Error deleting partnership: {e}')
-        return False
+async def load_all_whitelists() -> Dict[int, set]:
+    """Load all whitelists"""
+    whitelists = defaultdict(set)
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        async with db.execute('SELECT guild_id, user_id FROM whitelist') as cursor:
+            async for row in cursor:
+                whitelists[row[0]].add(row[1])
+    return whitelists
 
 # ============= THREAT LEVELS =============
 
-async def set_threat_level(guild_id: int, level: int, reason: str, set_by: int) -> bool:
-    """Set server threat level"""
-    try:
-        query = '''
-            INSERT INTO threat_levels (guild_id, threat_level, reason, set_by)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(guild_id) DO UPDATE SET threat_level = ?, reason = ?, set_by = ?, set_at = CURRENT_TIMESTAMP
-        '''
-        await execute_query(query, (guild_id, level, reason, set_by, level, reason, set_by))
-        return True
-    except Exception as e:
-        logger.error(f'Error setting threat level: {e}')
-        return False
+async def set_threat_level(guild_id: int, level: int, set_by: int = None):
+    """Set threat level"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            INSERT INTO threat_levels (guild_id, threat_level, set_by)
+            VALUES (?, ?, ?)
+        ''', (guild_id, level, set_by))
+        await db.commit()
 
-async def get_current_threat_level(guild_id: int) -> dict:
+async def get_current_threat_level(guild_id: int) -> Optional[Dict[str, Any]]:
     """Get current threat level"""
-    try:
-        result = await execute_query(
-            'SELECT threat_level, reason, set_by, set_at FROM threat_levels WHERE guild_id = ?',
-            (guild_id,),
-            fetch_one=True
-        )
-        if result:
-            return result
-        return {'threat_level': 0, 'reason': 'No threat', 'set_by': None, 'set_at': None}
-    except Exception as e:
-        logger.error(f'Error getting threat level: {e}')
-        return {'threat_level': 0, 'reason': 'Error', 'set_by': None, 'set_at': None}
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute('''
+            SELECT * FROM threat_levels
+            WHERE guild_id = ?
+            ORDER BY set_at DESC
+            LIMIT 1
+        ''', (guild_id,)) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+# ============= ACTIVITY LOGS =============
+
+async def add_log(guild_id: int, category: str, user_id: int = None, details: Dict = None):
+    """Add activity log"""
+    import json
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            INSERT INTO activity_logs (guild_id, category, user_id, details)
+            VALUES (?, ?, ?, ?)
+        ''', (guild_id, category, user_id, json.dumps(details) if details else None))
+        await db.commit()
+
+async def get_logs(guild_id: int, category: str = None, limit: int = 50) -> List[Dict[str, Any]]:
+    """Get activity logs"""
+    import json
+    logs = []
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if category:
+            query = 'SELECT * FROM activity_logs WHERE guild_id = ? AND category = ? ORDER BY timestamp DESC LIMIT ?'
+            params = (guild_id, category, limit)
+        else:
+            query = 'SELECT * FROM activity_logs WHERE guild_id = ? ORDER BY timestamp DESC LIMIT ?'
+            params = (guild_id, limit)
+        
+        async with db.execute(query, params) as cursor:
+            async for row in cursor:
+                log_dict = dict(row)
+                if log_dict.get('details'):
+                    try:
+                        log_dict['details'] = json.loads(log_dict['details'])
+                    except:
+                        pass
+                logs.append(log_dict)
+    return logs
+
+async def get_recent_alerts(guild_id: int, hours: int = 6) -> List[Dict[str, Any]]:
+    """Get recent security alerts"""
+    cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute('''
+            SELECT * FROM activity_logs
+            WHERE guild_id = ? AND category = 'security_alert' AND timestamp > ?
+            ORDER BY timestamp DESC
+        ''', (guild_id, cutoff)) as cursor:
+            return [dict(row) async for row in cursor]
+
+async def delete_old_logs(cutoff: datetime):
+    """Delete logs older than cutoff date"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            DELETE FROM activity_logs WHERE timestamp < ?
+        ''', (cutoff.isoformat(),))
+        await db.commit()
+
+# ============= USER EMAILS =============
+
+async def set_user_email(guild_id: int, user_id: int, email: str):
+    """Set user email"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            INSERT INTO user_emails (guild_id, user_id, email)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, user_id) DO UPDATE SET email = ?, added_at = CURRENT_TIMESTAMP
+        ''', (guild_id, user_id, email, email))
+        await db.commit()
+
+async def get_user_email(guild_id: int, user_id: int) -> Optional[str]:
+    """Get user email"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        async with db.execute('''
+            SELECT email FROM user_emails WHERE guild_id = ? AND user_id = ?
+        ''', (guild_id, user_id)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+async def remove_user_email(guild_id: int, user_id: int) -> bool:
+    """Remove user email"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute('''
+            DELETE FROM user_emails WHERE guild_id = ? AND user_id = ?
+        ''', (guild_id, user_id))
+        await db.commit()
+        return cursor.rowcount > 0
+
+# ============= SHIFTS =============
+
+async def create_shift(guild_id: int, user_id: int, department: str = None, start_time: datetime = None, callsign: str = None):
+    """Create new shift"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            INSERT INTO shifts (guild_id, user_id, department, callsign, start_time)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (guild_id, user_id, department, callsign, (start_time or datetime.now()).isoformat()))
+        await db.commit()
+
+async def end_shift(guild_id: int, user_id: int, end_time: datetime, duration: float, force_ended: bool = False):
+    """End active shift"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            UPDATE shifts
+            SET end_time = ?, duration_seconds = ?, force_ended = ?
+            WHERE guild_id = ? AND user_id = ? AND end_time IS NULL
+        ''', (end_time.isoformat(), int(duration), force_ended, guild_id, user_id))
+        await db.commit()
+
+async def get_shift_history(guild_id: int, user_id: int = None, limit: int = 10) -> List[Dict[str, Any]]:
+    """Get shift history"""
+    shifts = []
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if user_id:
+            query = '''
+                SELECT * FROM shifts
+                WHERE guild_id = ? AND user_id = ?
+                ORDER BY start_time DESC
+                LIMIT ?
+            '''
+            params = (guild_id, user_id, limit)
+        else:
+            query = '''
+                SELECT * FROM shifts
+                WHERE guild_id = ?
+                ORDER BY start_time DESC
+                LIMIT ?
+            '''
+            params = (guild_id, limit)
+        
+        async with db.execute(query, params) as cursor:
+            async for row in cursor:
+                shifts.append(dict(row))
+    return shifts
+
+async def detect_shift_violations(guild_id: int, hours: int = 24) -> List[Dict[str, Any]]:
+    """Detect shift violations in time period"""
+    cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+    violations = []
+    
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        
+        # Find shifts longer than 12 hours
+        async with db.execute('''
+            SELECT user_id, department, duration_seconds, start_time
+            FROM shifts
+            WHERE guild_id = ? AND start_time > ? AND duration_seconds > 43200
+        ''', (guild_id, cutoff)) as cursor:
+            async for row in cursor:
+                violations.append({
+                    'user_id': row['user_id'],
+                    'type': 'excessive_shift_duration',
+                    'department': row['department'],
+                    'timestamp': row['start_time']
+                })
+        
+        # Find force-ended shifts
+        async with db.execute('''
+            SELECT user_id, department, start_time
+            FROM shifts
+            WHERE guild_id = ? AND start_time > ? AND force_ended = 1
+        ''', (guild_id, cutoff)) as cursor:
+            async for row in cursor:
+                violations.append({
+                    'user_id': row['user_id'],
+                    'type': 'force_ended_shift',
+                    'department': row['department'],
+                    'timestamp': row['start_time']
+                })
+    
+    return violations
+
+async def detect_shift_overlaps(guild_id: int) -> List[Dict[str, Any]]:
+    """Detect overlapping shifts"""
+    overlaps = []
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute('''
+            SELECT s1.user_id as user1, s2.user_id as user2, s1.department
+            FROM shifts s1
+            JOIN shifts s2 ON s1.guild_id = s2.guild_id
+                AND s1.department = s2.department
+                AND s1.id != s2.id
+                AND s1.end_time IS NULL
+                AND s2.end_time IS NULL
+            WHERE s1.guild_id = ?
+        ''', (guild_id,)) as cursor:
+            async for row in cursor:
+                overlaps.append({
+                    'users': [row['user1'], row['user2']],
+                    'department': row['department']
+                })
+    return overlaps
+
+async def generate_shift_report(guild_id: int, days: int = 7) -> Dict[str, Any]:
+    """Generate shift statistics report"""
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        # Total shifts
+        async with db.execute('''
+            SELECT COUNT(*) FROM shifts
+            WHERE guild_id = ? AND start_time > ? AND end_time IS NOT NULL
+        ''', (guild_id, cutoff)) as cursor:
+            total_shifts = (await cursor.fetchone())[0]
+        
+        # Total hours
+        async with db.execute('''
+            SELECT SUM(duration_seconds) FROM shifts
+            WHERE guild_id = ? AND start_time > ? AND end_time IS NOT NULL
+        ''', (guild_id, cutoff)) as cursor:
+            total_seconds = (await cursor.fetchone())[0] or 0
+            total_hours = total_seconds / 3600
+        
+        # Average duration
+        avg_duration = total_hours / total_shifts if total_shifts > 0 else 0
+        
+        # Top user
+        db.row_factory = aiosqlite.Row
+        async with db.execute('''
+            SELECT user_id, COUNT(*) as shift_count
+            FROM shifts
+            WHERE guild_id = ? AND start_time > ? AND end_time IS NOT NULL
+            GROUP BY user_id
+            ORDER BY shift_count DESC
+            LIMIT 1
+        ''', (guild_id, cutoff)) as cursor:
+            row = await cursor.fetchone()
+            top_user = f"User {row['user_id']}" if row else "N/A"
+        
+        # Top department
+        async with db.execute('''
+            SELECT department, COUNT(*) as shift_count
+            FROM shifts
+            WHERE guild_id = ? AND start_time > ? AND end_time IS NOT NULL AND department IS NOT NULL
+            GROUP BY department
+            ORDER BY shift_count DESC
+            LIMIT 1
+        ''', (guild_id, cutoff)) as cursor:
+            row = await cursor.fetchone()
+            top_dept = row['department'] if row else "N/A"
+        
+        return {
+            'total_shifts': total_shifts,
+            'total_hours': total_hours,
+            'avg_duration': avg_duration,
+            'top_user': top_user,
+            'top_dept': top_dept
+        }
+
+# ============= DEPARTMENTS =============
+
+async def create_department(guild_id: int, name: str, description: str = None, role_id: int = None):
+    """Create new department"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            INSERT INTO departments (guild_id, name, description, role_id)
+            VALUES (?, ?, ?, ?)
+        ''', (guild_id, name, description, role_id))
+        await db.commit()
+
+async def get_department(guild_id: int, name: str) -> Optional[Dict[str, Any]]:
+    """Get department info"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute('''
+            SELECT * FROM departments WHERE guild_id = ? AND name = ?
+        ''', (guild_id, name)) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+async def get_all_departments(guild_id: int) -> List[Dict[str, Any]]:
+    """Get all departments"""
+    departments = []
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute('''
+            SELECT * FROM departments WHERE guild_id = ? ORDER BY name
+        ''', (guild_id,)) as cursor:
+            async for row in cursor:
+                departments.append(dict(row))
+    return departments
+
+async def set_department_head(guild_id: int, department: str, user_id: int):
+    """Set department head"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            UPDATE departments SET department_head = ?
+            WHERE guild_id = ? AND name = ?
+        ''', (user_id, guild_id, department))
+        await db.commit()
+
+async def update_department_field(guild_id: int, department: str, field: str, value: Any):
+    """Update department field"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(f'''
+            UPDATE departments SET {field} = ?
+            WHERE guild_id = ? AND name = ?
+        ''', (value, guild_id, department))
+        await db.commit()
+
+async def add_department_member(guild_id: int, user_id: int, department: str, status: str = 'member'):
+    """Add member to department"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            INSERT OR REPLACE INTO department_members (guild_id, user_id, department, status)
+            VALUES (?, ?, ?, ?)
+        ''', (guild_id, user_id, department, status))
+        await db.commit()
+
+async def is_department_member(guild_id: int, user_id: int, department: str) -> bool:
+    """Check if user is department member"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        async with db.execute('''
+            SELECT 1 FROM department_members
+            WHERE guild_id = ? AND user_id = ? AND department = ?
+        ''', (guild_id, user_id, department)) as cursor:
+            return await cursor.fetchone() is not None
+
+async def get_department_members(guild_id: int, department: str) -> List[Dict[str, Any]]:
+    """Get department members"""
+    members = []
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute('''
+            SELECT * FROM department_members
+            WHERE guild_id = ? AND department = ?
+        ''', (guild_id, department)) as cursor:
+            async for row in cursor:
+                members.append(dict(row))
+    return members
+
+async def get_department_shifts(guild_id: int, department: str, limit: int = 100) -> List[Dict[str, Any]]:
+    """Get shifts for department"""
+    shifts = []
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute('''
+            SELECT * FROM shifts
+            WHERE guild_id = ? AND department = ?
+            ORDER BY start_time DESC
+            LIMIT ?
+        ''', (guild_id, department, limit)) as cursor:
+            async for row in cursor:
+                shifts.append(dict(row))
+    return shifts
+
+# ============= DEPARTMENT JOIN REQUESTS =============
+
+async def create_department_join_request(guild_id: int, user_id: int, department: str, status: str = 'pending') -> int:
+    """Create join request"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute('''
+            INSERT INTO department_join_requests (guild_id, user_id, department, status)
+            VALUES (?, ?, ?, ?)
+        ''', (guild_id, user_id, department, status))
+        await db.commit()
+        return cursor.lastrowid
+
+async def get_department_join_request(guild_id: int, request_id: int) -> Optional[Dict[str, Any]]:
+    """Get join request by ID"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute('''
+            SELECT * FROM department_join_requests
+            WHERE guild_id = ? AND id = ?
+        ''', (guild_id, request_id)) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+async def get_department_join_requests(guild_id: int, department: str = None, status: str = None) -> List[Dict[str, Any]]:
+    """Get join requests"""
+    requests = []
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        
+        if department and status:
+            query = 'SELECT * FROM department_join_requests WHERE guild_id = ? AND department = ? AND status = ?'
+            params = (guild_id, department, status)
+        elif status:
+            query = 'SELECT * FROM department_join_requests WHERE guild_id = ? AND status = ?'
+            params = (guild_id, status)
+        else:
+            query = 'SELECT * FROM department_join_requests WHERE guild_id = ?'
+            params = (guild_id,)
+        
+        async with db.execute(query, params) as cursor:
+            async for row in cursor:
+                requests.append(dict(row))
+    return requests
+
+async def update_department_join_request_status(guild_id: int, request_id: int, status: str, reason: str = None):
+    """Update join request status"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            UPDATE department_join_requests
+            SET status = ?, reason = ?, processed_at = CURRENT_TIMESTAMP
+            WHERE guild_id = ? AND id = ?
+        ''', (status, reason, guild_id, request_id))
+        await db.commit()
+
+# ============= ROLE REQUESTS =============
+
+async def add_role_request(guild_id: int, user_id: int, role_id: int, status: str = 'pending'):
+    """Add role request"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            INSERT INTO role_requests (guild_id, user_id, role_id, status)
+            VALUES (?, ?, ?, ?)
+        ''', (guild_id, user_id, role_id, status))
+        await db.commit()
+
+async def get_role_requests(guild_id: int, status: str = None) -> List[Dict[str, Any]]:
+    """Get role requests"""
+    requests = []
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if status:
+            query = 'SELECT * FROM role_requests WHERE guild_id = ? AND status = ?'
+            params = (guild_id, status)
+        else:
+            query = 'SELECT * FROM role_requests WHERE guild_id = ?'
+            params = (guild_id,)
+        
+        async with db.execute(query, params) as cursor:
+            async for row in cursor:
+                requests.append(dict(row))
+    return requests
+
+async def update_role_request_status(guild_id: int, user_id: int, role_id: int, status: str):
+    """Update role request status"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            UPDATE role_requests
+            SET status = ?, processed_at = CURRENT_TIMESTAMP
+            WHERE guild_id = ? AND user_id = ? AND role_id = ?
+        ''', (status, guild_id, user_id, role_id))
+        await db.commit()
+
+# ============= PARTNERSHIPS =============
+
+async def add_partnership(guild_id: int, partner_guild_id: int, guild_name: str, description: str = None):
+    """Add partnership"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            INSERT OR IGNORE INTO partnerships (guild_id, partner_guild_id, guild_name, description)
+            VALUES (?, ?, ?, ?)
+        ''', (guild_id, partner_guild_id, guild_name, description))
+        await db.commit()
+
+async def remove_partnership(guild_id: int, partner_guild_id: int) -> bool:
+    """Remove partnership"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute('''
+            DELETE FROM partnerships WHERE guild_id = ? AND partner_guild_id = ?
+        ''', (guild_id, partner_guild_id))
+        await db.commit()
+        return cursor.rowcount > 0
+
+async def get_partnerships(guild_id: int) -> List[Dict[str, Any]]:
+    """Get all partnerships"""
+    partnerships = []
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute('''
+            SELECT * FROM partnerships WHERE guild_id = ? ORDER BY added_at DESC
+        ''', (guild_id,)) as cursor:
+            async for row in cursor:
+                partnerships.append(dict(row))
+    return partnerships
+
+# ============= MEMBER TIERS =============
+
+async def get_member_tier(guild_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+    """Get member tier"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute('''
+            SELECT * FROM member_tiers WHERE guild_id = ? AND user_id = ?
+        ''', (guild_id, user_id)) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+async def set_member_tier(guild_id: int, user_id: int, tier: int):
+    """Set member tier"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            INSERT INTO member_tiers (guild_id, user_id, tier)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, user_id) DO UPDATE SET tier = ?, updated_at = CURRENT_TIMESTAMP
+        ''', (guild_id, user_id, tier, tier))
+        await db.commit()
+
+# ============= VERIFICATIONS (ROBLOX) =============
+
+async def create_verification(guild_id: int, user_id: int, verification_code: str):
+    """Create verification entry"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            INSERT INTO verifications (guild_id, user_id, verification_code)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, user_id) DO UPDATE SET verification_code = ?, created_at = CURRENT_TIMESTAMP
+        ''', (guild_id, user_id, verification_code, verification_code))
+        await db.commit()
+
+async def get_verification(guild_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+    """Get verification entry"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute('''
+            SELECT * FROM verifications WHERE guild_id = ? AND user_id = ?
+        ''', (guild_id, user_id)) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+async def complete_verification(guild_id: int, user_id: int, roblox_id: int, roblox_username: str):
+    """Complete verification"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            UPDATE verifications
+            SET roblox_id = ?, roblox_username = ?, verified = 1, verified_at = CURRENT_TIMESTAMP
+            WHERE guild_id = ? AND user_id = ?
+        ''', (roblox_id, roblox_username, guild_id, user_id))
+        await db.commit()
+
+# ============= UTILITY FUNCTIONS =============
+
+async def cleanup_database():
+    """Clean up old/expired data"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        # Delete old unverified verifications (older than 30 days)
+        await db.execute('''
+            DELETE FROM verifications
+            WHERE verified = 0 AND created_at < datetime('now', '-30 days')
+        ''')
+        
+        # Delete old processed requests (older than 90 days)
+        await db.execute('''
+            DELETE FROM department_join_requests
+            WHERE status != 'pending' AND processed_at < datetime('now', '-90 days')
+        ''')
+        
+        await db.execute('''
+            DELETE FROM role_requests
+            WHERE status != 'pending' AND processed_at < datetime('now', '-90 days')
+        ''')
+        
+        await db.commit()
+
+async def get_database_stats() -> Dict[str, int]:
+    """Get database statistics"""
+    stats = {}
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        tables = [
+            'server_config', 'whitelist', 'threat_levels', 'activity_logs',
+            'user_emails', 'shifts', 'departments', 'department_members',
+            'department_join_requests', 'role_requests', 'partnerships',
+            'member_tiers', 'verifications'
+        ]
+        
+        for table in tables:
+            async with db.execute(f'SELECT COUNT(*) FROM {table}') as cursor:
+                count = (await cursor.fetchone())[0]
+                stats[table] = count
+    
+    return stats
