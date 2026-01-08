@@ -8,6 +8,7 @@ import logging
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 from collections import defaultdict
+import json
 
 logger = logging.getLogger('SecurityBot.Database')
 

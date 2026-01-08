@@ -32,12 +32,19 @@ except ImportError:
     exit(1)
 
 # ============= LOGGING =============
+import sys
+
+# Fix Windows console encoding
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('security_bot.log'),
-        logging.StreamHandler()
+        logging.FileHandler('security_bot.log', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger('SecurityBot')
@@ -375,8 +382,6 @@ async def quarantine_user(guild: discord.Guild, user: discord.User, reason: str)
         logger.error(f"Quarantine error: {e}")
         return False
 
-# ============= BOT EVENTS =============
-
 @bot.event
 async def on_ready():
     """Startup"""
@@ -398,6 +403,22 @@ async def on_ready():
     except Exception as e:
         logger.error(f'Load error: {e}')
     
+    # Add persistent views
+    bot.add_view(VerificationView())
+    bot.add_view(RobloxVerificationView())
+    logger.info('✅ Added persistent views')
+    
+    # Start background tasks
+    if not shift_heartbeat.is_running():
+        shift_heartbeat.start()
+    if not cleanup_old_logs.is_running():
+        cleanup_old_logs.start()
+    if not reset_daily_threat.is_running():
+        reset_daily_threat.start()
+    if not daily_violation_report.is_running():
+        daily_violation_report.start()
+    logger.info('✅ Background tasks started')
+    
     try:
         synced = await bot.tree.sync()
         logger.info(f'✅ Synced {len(synced)} commands')
@@ -405,11 +426,6 @@ async def on_ready():
         logger.error(f'Sync error: {e}')
     
     logger.info('🔍 Monitoring...')
-
-@bot.event
-async def on_error(event, *args, **kwargs):
-    """Error"""
-    logger.error(f'Event error: {event}', exc_info=True)
 
 # ============= SETUP COMMANDS =============
 
@@ -3581,22 +3597,6 @@ async def daily_reports_status(interaction: discord.Interaction):
     except Exception as e:
         logger.error(f"Error checking daily reports: {e}")
         await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
-
-
-# ============= START BACKGROUND TASKS =============
-
-# Add this in on_ready():
-@bot.event
-async def on_ready_with_tasks():
-    """Start background tasks"""
-    if not shift_heartbeat.is_running():
-        shift_heartbeat.start()
-    if not cleanup_old_logs.is_running():
-        cleanup_old_logs.start()
-    if not reset_daily_threat.is_running():
-        reset_daily_threat.start()
-    
-    logger.info("✅ Background tasks started")
 
 # ============= BOT START =============
 
