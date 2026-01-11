@@ -1,6 +1,6 @@
 """
 SENTINEL SECURITY BOT v2.0 - DATABASE MODULE
-Complete database operations for all bot features
+Complete database operations for all bot features - FIXED VERSION
 """
 
 import aiosqlite
@@ -32,6 +32,8 @@ async def init_database():
                 lockdown_enabled BOOLEAN DEFAULT 0,
                 onduty_role_id INTEGER,
                 allstaff_role_id INTEGER,
+                message_log_channel_id INTEGER,
+                voice_log_channel_id INTEGER,
                 daily_reports_enabled BOOLEAN DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -202,6 +204,19 @@ async def init_database():
             )
         ''')
         
+        # Warnings table
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS warnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                warner_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                active BOOLEAN DEFAULT 1
+            )
+        ''')
+        
         await db.commit()
         logger.info("✅ Database initialized successfully")
 
@@ -317,7 +332,6 @@ async def get_current_threat_level(guild_id: int) -> Optional[Dict[str, Any]]:
 
 async def add_log(guild_id: int, category: str, user_id: int = None, details: Dict = None):
     """Add activity log"""
-    import json
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute('''
             INSERT INTO activity_logs (guild_id, category, user_id, details)
@@ -325,15 +339,191 @@ async def add_log(guild_id: int, category: str, user_id: int = None, details: Di
         ''', (guild_id, category, user_id, json.dumps(details) if details else None))
         await db.commit()
 
-async def get_logs(guild_id: int, category: str = None, limit: int = 50) -> List[Dict[str, Any]]:
+async def get_logs(guild_id: int, category: str = None, user_id: int = None, limit: int = 50) -> List[Dict[str, Any]]:
     """Get activity logs"""
-    import json
     logs = []
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
-        if category:
+        
+        if category and user_id:
+            query = 'SELECT * FROM activity_logs WHERE guild_id = ? AND category = ? AND user_id = ? ORDER BY timestamp DESC LIMIT ?'
+            params = (guild_id, category, user_id, limit)
+        elif category:
             query = 'SELECT * FROM activity_logs WHERE guild_id = ? AND category = ? ORDER BY timestamp DESC LIMIT ?'
             params = (guild_id, category, limit)
+        elif user_id:
+            query = 'SELECT * FROM activity_logs WHERE guild_id = ? AND user_id = ? ORDER BY timestamp DESC LIMIT ?'
+            params = (guild_id, user_id, limit)
+        else:
+            query = 'SELECT * FROM activity_logs WHERE guild_id = ? ORDER BY timestamp DESC LIMIT ?'
+            params = (guild_id, limit)
+        
+        async with db.execute(query, params) as cursor:
+            async for row in cursor:
+                requests.append(dict(row))
+    return requests
+
+async def update_role_request_status(guild_id: int, user_id: int, role_id: int, status: str):
+    """Update role request status"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            UPDATE role_requests
+            SET status = ?, processed_at = CURRENT_TIMESTAMP
+            WHERE guild_id = ? AND user_id = ? AND role_id = ?
+        ''', (status, guild_id, user_id, role_id))
+        await db.commit()
+
+# ============= PARTNERSHIPS =============
+
+async def add_partnership(guild_id: int, partner_guild_id: int, guild_name: str, description: str = None):
+    """Add partnership"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            INSERT OR IGNORE INTO partnerships (guild_id, partner_guild_id, guild_name, description)
+            VALUES (?, ?, ?, ?)
+        ''', (guild_id, partner_guild_id, guild_name, description))
+        await db.commit()
+
+async def remove_partnership(guild_id: int, partner_guild_id: int) -> bool:
+    """Remove partnership"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute('''
+            DELETE FROM partnerships WHERE guild_id = ? AND partner_guild_id = ?
+        ''', (guild_id, partner_guild_id))
+        await db.commit()
+        return cursor.rowcount > 0
+
+async def get_partnerships(guild_id: int) -> List[Dict[str, Any]]:
+    """Get partnerships"""
+    partnerships = []
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute('''
+            SELECT * FROM partnerships WHERE guild_id = ? ORDER BY added_at DESC
+        ''', (guild_id,)) as cursor:
+            async for row in cursor:
+                partnerships.append(dict(row))
+    return partnerships
+
+# ============= MEMBER TIERS =============
+
+async def get_member_tier(guild_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+    """Get member tier"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute('''
+            SELECT * FROM member_tiers WHERE guild_id = ? AND user_id = ?
+        ''', (guild_id, user_id)) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+async def set_member_tier(guild_id: int, user_id: int, tier: int):
+    """Set member tier"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            INSERT INTO member_tiers (guild_id, user_id, tier)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, user_id) DO UPDATE SET tier = ?, updated_at = CURRENT_TIMESTAMP
+        ''', (guild_id, user_id, tier, tier))
+        await db.commit()
+
+# ============= VERIFICATIONS =============
+
+async def create_verification(guild_id: int, user_id: int, verification_code: str):
+    """Create verification"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            INSERT INTO verifications (guild_id, user_id, verification_code)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, user_id) DO UPDATE SET verification_code = ?, created_at = CURRENT_TIMESTAMP
+        ''', (guild_id, user_id, verification_code, verification_code))
+        await db.commit()
+
+async def get_verification(guild_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+    """Get verification"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute('''
+            SELECT * FROM verifications WHERE guild_id = ? AND user_id = ?
+        ''', (guild_id, user_id)) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+async def complete_verification(guild_id: int, user_id: int, roblox_id: int, roblox_username: str):
+    """Complete verification"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('''
+            UPDATE verifications
+            SET roblox_id = ?, roblox_username = ?, verified = 1, verified_at = CURRENT_TIMESTAMP
+            WHERE guild_id = ? AND user_id = ?
+        ''', (roblox_id, roblox_username, guild_id, user_id))
+        await db.commit()
+
+# ============= WARNING SYSTEM =============
+
+async def add_warning(guild_id: int, user_id: int, warner_id: int, reason: str) -> int:
+    """Add warning"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            '''INSERT INTO warnings (guild_id, user_id, warner_id, reason)
+               VALUES (?, ?, ?, ?)''',
+            (guild_id, user_id, warner_id, reason)
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+async def get_active_warnings(guild_id: int, user_id: int) -> List[Dict[str, Any]]:
+    """Get active warnings"""
+    expire_date = datetime.now() - timedelta(days=30)
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            '''SELECT * FROM warnings 
+               WHERE guild_id = ? AND user_id = ? AND active = 1 
+               AND created_at > ?
+               ORDER BY created_at DESC''',
+            (guild_id, user_id, expire_date.isoformat())
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def remove_warning(guild_id: int, warning_id: int) -> bool:
+    """Remove warning"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            '''UPDATE warnings SET active = 0 
+               WHERE id = ? AND guild_id = ?''',
+            (warning_id, guild_id)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+async def clear_user_warnings(guild_id: int, user_id: int) -> int:
+    """Clear all warnings"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            '''UPDATE warnings SET active = 0 
+               WHERE guild_id = ? AND user_id = ? AND active = 1''',
+            (guild_id, user_id)
+        )
+        await db.commit()
+        return cursor.rowcount
+
+async def get_logs_with_details(guild_id: int, category: str = None, user_id: int = None, limit: int = 50) -> List[Dict[str, Any]]:
+    """Get activity logs with parsed details"""
+    logs = []
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        
+        if category and user_id:
+            query = 'SELECT * FROM activity_logs WHERE guild_id = ? AND category = ? AND user_id = ? ORDER BY timestamp DESC LIMIT ?'
+            params = (guild_id, category, user_id, limit)
+        elif category:
+            query = 'SELECT * FROM activity_logs WHERE guild_id = ? AND category = ? ORDER BY timestamp DESC LIMIT ?'
+            params = (guild_id, category, limit)
+        elif user_id:
+            query = 'SELECT * FROM activity_logs WHERE guild_id = ? AND user_id = ? ORDER BY timestamp DESC LIMIT ?'
+            params = (guild_id, user_id, limit)
         else:
             query = 'SELECT * FROM activity_logs WHERE guild_id = ? ORDER BY timestamp DESC LIMIT ?'
             params = (guild_id, limit)
@@ -448,14 +638,13 @@ async def get_shift_history(guild_id: int, user_id: int = None, limit: int = 10)
     return shifts
 
 async def detect_shift_violations(guild_id: int, hours: int = 24) -> List[Dict[str, Any]]:
-    """Detect shift violations in time period"""
+    """Detect shift violations"""
     cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
     violations = []
     
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
         
-        # Find shifts longer than 12 hours
         async with db.execute('''
             SELECT user_id, department, duration_seconds, start_time
             FROM shifts
@@ -469,7 +658,6 @@ async def detect_shift_violations(guild_id: int, hours: int = 24) -> List[Dict[s
                     'timestamp': row['start_time']
                 })
         
-        # Find force-ended shifts
         async with db.execute('''
             SELECT user_id, department, start_time
             FROM shifts
@@ -508,18 +696,16 @@ async def detect_shift_overlaps(guild_id: int) -> List[Dict[str, Any]]:
     return overlaps
 
 async def generate_shift_report(guild_id: int, days: int = 7) -> Dict[str, Any]:
-    """Generate shift statistics report"""
+    """Generate shift report"""
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
     
     async with aiosqlite.connect(DATABASE_PATH) as db:
-        # Total shifts
         async with db.execute('''
             SELECT COUNT(*) FROM shifts
             WHERE guild_id = ? AND start_time > ? AND end_time IS NOT NULL
         ''', (guild_id, cutoff)) as cursor:
             total_shifts = (await cursor.fetchone())[0]
         
-        # Total hours
         async with db.execute('''
             SELECT SUM(duration_seconds) FROM shifts
             WHERE guild_id = ? AND start_time > ? AND end_time IS NOT NULL
@@ -527,10 +713,8 @@ async def generate_shift_report(guild_id: int, days: int = 7) -> Dict[str, Any]:
             total_seconds = (await cursor.fetchone())[0] or 0
             total_hours = total_seconds / 3600
         
-        # Average duration
         avg_duration = total_hours / total_shifts if total_shifts > 0 else 0
         
-        # Top user
         db.row_factory = aiosqlite.Row
         async with db.execute('''
             SELECT user_id, COUNT(*) as shift_count
@@ -543,7 +727,6 @@ async def generate_shift_report(guild_id: int, days: int = 7) -> Dict[str, Any]:
             row = await cursor.fetchone()
             top_user = f"User {row['user_id']}" if row else "N/A"
         
-        # Top department
         async with db.execute('''
             SELECT department, COUNT(*) as shift_count
             FROM shifts
@@ -566,7 +749,7 @@ async def generate_shift_report(guild_id: int, days: int = 7) -> Dict[str, Any]:
 # ============= DEPARTMENTS =============
 
 async def create_department(guild_id: int, name: str, description: str = None, role_id: int = None):
-    """Create new department"""
+    """Create department"""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute('''
             INSERT INTO departments (guild_id, name, description, role_id)
@@ -575,7 +758,7 @@ async def create_department(guild_id: int, name: str, description: str = None, r
         await db.commit()
 
 async def get_department(guild_id: int, name: str) -> Optional[Dict[str, Any]]:
-    """Get department info"""
+    """Get department"""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute('''
@@ -615,7 +798,7 @@ async def update_department_field(guild_id: int, department: str, field: str, va
         await db.commit()
 
 async def add_department_member(guild_id: int, user_id: int, department: str, status: str = 'member'):
-    """Add member to department"""
+    """Add department member"""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute('''
             INSERT OR REPLACE INTO department_members (guild_id, user_id, department, status)
@@ -624,7 +807,7 @@ async def add_department_member(guild_id: int, user_id: int, department: str, st
         await db.commit()
 
 async def is_department_member(guild_id: int, user_id: int, department: str) -> bool:
-    """Check if user is department member"""
+    """Check department member"""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         async with db.execute('''
             SELECT 1 FROM department_members
@@ -646,7 +829,7 @@ async def get_department_members(guild_id: int, department: str) -> List[Dict[st
     return members
 
 async def get_department_shifts(guild_id: int, department: str, limit: int = 100) -> List[Dict[str, Any]]:
-    """Get shifts for department"""
+    """Get department shifts"""
     shifts = []
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -673,7 +856,7 @@ async def create_department_join_request(guild_id: int, user_id: int, department
         return cursor.lastrowid
 
 async def get_department_join_request(guild_id: int, request_id: int) -> Optional[Dict[str, Any]]:
-    """Get join request by ID"""
+    """Get join request"""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute('''
@@ -740,441 +923,3 @@ async def get_role_requests(guild_id: int, status: str = None) -> List[Dict[str,
         async with db.execute(query, params) as cursor:
             async for row in cursor:
                 requests.append(dict(row))
-    return requests
-
-async def update_role_request_status(guild_id: int, user_id: int, role_id: int, status: str):
-    """Update role request status"""
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute('''
-            UPDATE role_requests
-            SET status = ?, processed_at = CURRENT_TIMESTAMP
-            WHERE guild_id = ? AND user_id = ? AND role_id = ?
-        ''', (status, guild_id, user_id, role_id))
-        await db.commit()
-
-# ============= PARTNERSHIPS =============
-
-async def add_partnership(guild_id: int, partner_guild_id: int, guild_name: str, description: str = None):
-    """Add partnership"""
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute('''
-            INSERT OR IGNORE INTO partnerships (guild_id, partner_guild_id, guild_name, description)
-            VALUES (?, ?, ?, ?)
-        ''', (guild_id, partner_guild_id, guild_name, description))
-        await db.commit()
-
-async def remove_partnership(guild_id: int, partner_guild_id: int) -> bool:
-    """Remove partnership"""
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        cursor = await db.execute('''
-            DELETE FROM partnerships WHERE guild_id = ? AND partner_guild_id = ?
-        ''', (guild_id, partner_guild_id))
-        await db.commit()
-        return cursor.rowcount > 0
-
-async def get_partnerships(guild_id: int) -> List[Dict[str, Any]]:
-    """Get all partnerships"""
-    partnerships = []
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute('''
-            SELECT * FROM partnerships WHERE guild_id = ? ORDER BY added_at DESC
-        ''', (guild_id,)) as cursor:
-            async for row in cursor:
-                partnerships.append(dict(row))
-    return partnerships
-
-# ============= MEMBER TIERS =============
-
-async def get_member_tier(guild_id: int, user_id: int) -> Optional[Dict[str, Any]]:
-    """Get member tier"""
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute('''
-            SELECT * FROM member_tiers WHERE guild_id = ? AND user_id = ?
-        ''', (guild_id, user_id)) as cursor:
-            row = await cursor.fetchone()
-            return dict(row) if row else None
-
-async def set_member_tier(guild_id: int, user_id: int, tier: int):
-    """Set member tier"""
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute('''
-            INSERT INTO member_tiers (guild_id, user_id, tier)
-            VALUES (?, ?, ?)
-            ON CONFLICT(guild_id, user_id) DO UPDATE SET tier = ?, updated_at = CURRENT_TIMESTAMP
-        ''', (guild_id, user_id, tier, tier))
-        await db.commit()
-
-# ============= VERIFICATIONS (ROBLOX) =============
-
-async def create_verification(guild_id: int, user_id: int, verification_code: str):
-    """Create verification entry"""
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute('''
-            INSERT INTO verifications (guild_id, user_id, verification_code)
-            VALUES (?, ?, ?)
-            ON CONFLICT(guild_id, user_id) DO UPDATE SET verification_code = ?, created_at = CURRENT_TIMESTAMP
-        ''', (guild_id, user_id, verification_code, verification_code))
-        await db.commit()
-
-async def get_verification(guild_id: int, user_id: int) -> Optional[Dict[str, Any]]:
-    """Get verification entry"""
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute('''
-            SELECT * FROM verifications WHERE guild_id = ? AND user_id = ?
-        ''', (guild_id, user_id)) as cursor:
-            row = await cursor.fetchone()
-            return dict(row) if row else None
-
-async def complete_verification(guild_id: int, user_id: int, roblox_id: int, roblox_username: str):
-    """Complete verification"""
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute('''
-            UPDATE verifications
-            SET roblox_id = ?, roblox_username = ?, verified = 1, verified_at = CURRENT_TIMESTAMP
-            WHERE guild_id = ? AND user_id = ?
-        ''', (roblox_id, roblox_username, guild_id, user_id))
-        await db.commit()
-
-# ============= UTILITY FUNCTIONS =============
-
-async def cleanup_database():
-    """Clean up old/expired data"""
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        # Delete old unverified verifications (older than 30 days)
-        await db.execute('''
-            DELETE FROM verifications
-            WHERE verified = 0 AND created_at < datetime('now', '-30 days')
-        ''')
-        
-        # Delete old processed requests (older than 90 days)
-        await db.execute('''
-            DELETE FROM department_join_requests
-            WHERE status != 'pending' AND processed_at < datetime('now', '-90 days')
-        ''')
-        
-        await db.execute('''
-            DELETE FROM role_requests
-            WHERE status != 'pending' AND processed_at < datetime('now', '-90 days')
-        ''')
-        
-        await db.commit()
-
-async def get_database_stats() -> Dict[str, int]:
-    """Get database statistics"""
-    stats = {}
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        tables = [
-            'server_config', 'whitelist', 'threat_levels', 'activity_logs',
-            'user_emails', 'shifts', 'departments', 'department_members',
-            'department_join_requests', 'role_requests', 'partnerships',
-            'member_tiers', 'verifications'
-        ]
-        
-        for table in tables:
-            async with db.execute(f'SELECT COUNT(*) FROM {table}') as cursor:
-                count = (await cursor.fetchone())[0]
-                stats[table] = count
-    
-    return stats
-
-# ============= WARNING SYSTEM FUNCTIONS =============
-
-async def add_warning(guild_id: int, user_id: int, warner_id: int, reason: str) -> int:
-    """Add a warning to a user"""
-    async with aiosqlite.connect('sentinel.db') as db:
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS warnings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                warner_id INTEGER NOT NULL,
-                reason TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                active BOOLEAN DEFAULT 1,
-                FOREIGN KEY (guild_id) REFERENCES servers(guild_id)
-            )
-        ''')
-        
-        cursor = await db.execute(
-            '''INSERT INTO warnings (guild_id, user_id, warner_id, reason)
-               VALUES (?, ?, ?, ?)''',
-            (guild_id, user_id, warner_id, reason)
-        )
-        
-        await db.commit()
-        return cursor.lastrowid
-
-async def get_active_warnings(guild_id: int, user_id: int) -> List[Dict[str, Any]]:
-    """Get all active warnings for a user"""
-    async with aiosqlite.connect('sentinel.db') as db:
-        db.row_factory = aiosqlite.Row
-        
-        # Calculate expiry date
-        expire_date = datetime.now() - timedelta(days=30)  # Default 30 days
-        
-        cursor = await db.execute(
-            '''SELECT * FROM warnings 
-               WHERE guild_id = ? AND user_id = ? AND active = 1 
-               AND created_at > ?
-               ORDER BY created_at DESC''',
-            (guild_id, user_id, expire_date.isoformat())
-        )
-        
-        rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
-
-async def remove_warning(guild_id: int, warning_id: int) -> bool:
-    """Remove a specific warning"""
-    async with aiosqlite.connect('sentinel.db') as db:
-        cursor = await db.execute(
-            '''UPDATE warnings SET active = 0 
-               WHERE id = ? AND guild_id = ?''',
-            (warning_id, guild_id)
-        )
-        await db.commit()
-        return cursor.rowcount > 0
-
-async def clear_user_warnings(guild_id: int, user_id: int) -> int:
-    """Clear all warnings for a user"""
-    async with aiosqlite.connect('sentinel.db') as db:
-        cursor = await db.execute(
-            '''UPDATE warnings SET active = 0 
-               WHERE guild_id = ? AND user_id = ? AND active = 1''',
-            (guild_id, user_id)
-        )
-        await db.commit()
-        return cursor.rowcount
-
-async def get_recent_alerts(guild_id: int, hours: int = 6) -> List[Dict[str, Any]]:
-    """Get recent security alerts"""
-    async with aiosqlite.connect('sentinel.db') as db:
-        db.row_factory = aiosqlite.Row
-        
-        cutoff = datetime.now() - timedelta(hours=hours)
-        
-        cursor = await db.execute(
-            '''SELECT * FROM logs 
-               WHERE guild_id = ? AND category = 'security_alert' 
-               AND timestamp > ?
-               ORDER BY timestamp DESC''',
-            (guild_id, cutoff.isoformat())
-        )
-        
-        rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
-
-async def detect_shift_overlaps(guild_id: int) -> List[Dict[str, Any]]:
-    """Detect overlapping shifts (same user, multiple active shifts)"""
-    async with aiosqlite.connect('sentinel.db') as db:
-        db.row_factory = aiosqlite.Row
-        
-        cursor = await db.execute(
-            '''SELECT user_id, department, COUNT(*) as overlap_count
-               FROM shifts 
-               WHERE guild_id = ? AND end_time IS NULL
-               GROUP BY user_id, department
-               HAVING COUNT(*) > 1''',
-            (guild_id,)
-        )
-        
-        rows = await cursor.fetchall()
-        
-        overlaps = []
-        for row in rows:
-            # Get the overlapping user IDs
-            user_cursor = await db.execute(
-                '''SELECT user_id FROM shifts 
-                   WHERE guild_id = ? AND department = ? AND end_time IS NULL''',
-                (guild_id, row['department'])
-            )
-            users = [r[0] for r in await user_cursor.fetchall()]
-            
-            overlaps.append({
-                'department': row['department'],
-                'users': users,
-                'count': row['overlap_count']
-            })
-        
-        return overlaps
-
-async def detect_shift_violations(guild_id: int, hours: int = 24) -> List[Dict[str, Any]]:
-    """Detect shift violations (abnormally long shifts, etc.)"""
-    async with aiosqlite.connect('sentinel.db') as db:
-        db.row_factory = aiosqlite.Row
-        
-        cutoff = datetime.now() - timedelta(hours=hours)
-        
-        # Find shifts longer than 12 hours
-        cursor = await db.execute(
-            '''SELECT user_id, start_time, end_time, duration_seconds
-               FROM shifts 
-               WHERE guild_id = ? AND start_time > ? 
-               AND duration_seconds > ?''',
-            (guild_id, cutoff.isoformat(), 12 * 3600)
-        )
-        
-        rows = await cursor.fetchall()
-        
-        violations = []
-        for row in rows:
-            violations.append({
-                'user_id': row['user_id'],
-                'type': 'shift_too_long',
-                'duration': row['duration_seconds'],
-                'timestamp': row['start_time']
-            })
-        
-        return violations
-
-async def generate_shift_report(guild_id: int, days: int = 7) -> Dict[str, Any]:
-    """Generate comprehensive shift report"""
-    async with aiosqlite.connect('sentinel.db') as db:
-        db.row_factory = aiosqlite.Row
-        
-        cutoff = datetime.now() - timedelta(days=days)
-        
-        # Total shifts
-        cursor = await db.execute(
-            '''SELECT COUNT(*) as total FROM shifts 
-               WHERE guild_id = ? AND start_time > ?''',
-            (guild_id, cutoff.isoformat())
-        )
-        total_shifts = (await cursor.fetchone())['total']
-        
-        # Total hours
-        cursor = await db.execute(
-            '''SELECT SUM(duration_seconds) as total_seconds FROM shifts 
-               WHERE guild_id = ? AND start_time > ? AND duration_seconds IS NOT NULL''',
-            (guild_id, cutoff.isoformat())
-        )
-        total_seconds = (await cursor.fetchone())['total_seconds'] or 0
-        total_hours = total_seconds / 3600
-        
-        # Average duration
-        avg_duration = total_hours / total_shifts if total_shifts > 0 else 0
-        
-        # Top user
-        cursor = await db.execute(
-            '''SELECT user_id, COUNT(*) as shift_count 
-               FROM shifts 
-               WHERE guild_id = ? AND start_time > ?
-               GROUP BY user_id
-               ORDER BY shift_count DESC
-               LIMIT 1''',
-            (guild_id, cutoff.isoformat())
-        )
-        top_user_row = await cursor.fetchone()
-        top_user = f"User {top_user_row['user_id']}" if top_user_row else "N/A"
-        
-        # Top department
-        cursor = await db.execute(
-            '''SELECT department, COUNT(*) as shift_count 
-               FROM shifts 
-               WHERE guild_id = ? AND start_time > ? AND department IS NOT NULL
-               GROUP BY department
-               ORDER BY shift_count DESC
-               LIMIT 1''',
-            (guild_id, cutoff.isoformat())
-        )
-        top_dept_row = await cursor.fetchone()
-        top_dept = top_dept_row['department'] if top_dept_row else "N/A"
-        
-        return {
-            'total_shifts': total_shifts,
-            'total_hours': round(total_hours, 1),
-            'avg_duration': round(avg_duration, 1),
-            'top_user': top_user,
-            'top_dept': top_dept
-        }
-
-async def get_department_shifts(guild_id: int, department: str) -> List[Dict[str, Any]]:
-    """Get all shifts for a department"""
-    async with aiosqlite.connect('sentinel.db') as db:
-        db.row_factory = aiosqlite.Row
-        
-        cursor = await db.execute(
-            '''SELECT * FROM shifts 
-               WHERE guild_id = ? AND department = ?
-               ORDER BY start_time DESC
-               LIMIT 100''',
-            (guild_id, department)
-        )
-        
-        rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
-
-async def delete_old_logs(cutoff: datetime) -> int:
-    """Delete logs older than cutoff date"""
-    async with aiosqlite.connect('sentinel.db') as db:
-        cursor = await db.execute(
-            '''DELETE FROM logs WHERE timestamp < ?''',
-            (cutoff.isoformat(),)
-        )
-        await db.commit()
-        return cursor.rowcount
-
-async def set_server_config(guild_id: int, **kwargs) -> None:
-    """Set multiple server config fields at once"""
-    async with aiosqlite.connect('sentinel.db') as db:
-        # First ensure server exists
-        await db.execute(
-            '''INSERT OR IGNORE INTO servers (guild_id) VALUES (?)''',
-            (guild_id,)
-        )
-        
-        # Update each field
-        for key, value in kwargs.items():
-            await db.execute(
-                f'''UPDATE servers SET {key} = ? WHERE guild_id = ?''',
-                (value, guild_id)
-            )
-        
-        await db.commit()
-
-# ============= ENHANCED INIT DATABASE =============
-
-async def init_database():
-    """Initialize all database tables including new features"""
-    async with aiosqlite.connect('sentinel.db') as db:
-        # Existing tables...
-        
-        # Warnings table
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS warnings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                warner_id INTEGER NOT NULL,
-                reason TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                active BOOLEAN DEFAULT 1
-            )
-        ''')
-        
-        # Add new columns to servers table if they don't exist
-        try:
-            await db.execute('''
-                ALTER TABLE servers ADD COLUMN message_log_channel_id INTEGER
-            ''')
-        except:
-            pass
-        
-        try:
-            await db.execute('''
-                ALTER TABLE servers ADD COLUMN voice_log_channel_id INTEGER
-            ''')
-        except:
-            pass
-        
-        try:
-            await db.execute('''
-                ALTER TABLE servers ADD COLUMN daily_reports_enabled BOOLEAN DEFAULT 0
-            ''')
-        except:
-            pass
-        
-        await db.commit()
-        print("✅ Database initialized with new features")
