@@ -879,3 +879,302 @@ async def get_database_stats() -> Dict[str, int]:
                 stats[table] = count
     
     return stats
+
+# ============= WARNING SYSTEM FUNCTIONS =============
+
+async def add_warning(guild_id: int, user_id: int, warner_id: int, reason: str) -> int:
+    """Add a warning to a user"""
+    async with aiosqlite.connect('sentinel.db') as db:
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS warnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                warner_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                active BOOLEAN DEFAULT 1,
+                FOREIGN KEY (guild_id) REFERENCES servers(guild_id)
+            )
+        ''')
+        
+        cursor = await db.execute(
+            '''INSERT INTO warnings (guild_id, user_id, warner_id, reason)
+               VALUES (?, ?, ?, ?)''',
+            (guild_id, user_id, warner_id, reason)
+        )
+        
+        await db.commit()
+        return cursor.lastrowid
+
+async def get_active_warnings(guild_id: int, user_id: int) -> List[Dict[str, Any]]:
+    """Get all active warnings for a user"""
+    async with aiosqlite.connect('sentinel.db') as db:
+        db.row_factory = aiosqlite.Row
+        
+        # Calculate expiry date
+        expire_date = datetime.now() - timedelta(days=30)  # Default 30 days
+        
+        cursor = await db.execute(
+            '''SELECT * FROM warnings 
+               WHERE guild_id = ? AND user_id = ? AND active = 1 
+               AND created_at > ?
+               ORDER BY created_at DESC''',
+            (guild_id, user_id, expire_date.isoformat())
+        )
+        
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def remove_warning(guild_id: int, warning_id: int) -> bool:
+    """Remove a specific warning"""
+    async with aiosqlite.connect('sentinel.db') as db:
+        cursor = await db.execute(
+            '''UPDATE warnings SET active = 0 
+               WHERE id = ? AND guild_id = ?''',
+            (warning_id, guild_id)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+async def clear_user_warnings(guild_id: int, user_id: int) -> int:
+    """Clear all warnings for a user"""
+    async with aiosqlite.connect('sentinel.db') as db:
+        cursor = await db.execute(
+            '''UPDATE warnings SET active = 0 
+               WHERE guild_id = ? AND user_id = ? AND active = 1''',
+            (guild_id, user_id)
+        )
+        await db.commit()
+        return cursor.rowcount
+
+async def get_recent_alerts(guild_id: int, hours: int = 6) -> List[Dict[str, Any]]:
+    """Get recent security alerts"""
+    async with aiosqlite.connect('sentinel.db') as db:
+        db.row_factory = aiosqlite.Row
+        
+        cutoff = datetime.now() - timedelta(hours=hours)
+        
+        cursor = await db.execute(
+            '''SELECT * FROM logs 
+               WHERE guild_id = ? AND category = 'security_alert' 
+               AND timestamp > ?
+               ORDER BY timestamp DESC''',
+            (guild_id, cutoff.isoformat())
+        )
+        
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def detect_shift_overlaps(guild_id: int) -> List[Dict[str, Any]]:
+    """Detect overlapping shifts (same user, multiple active shifts)"""
+    async with aiosqlite.connect('sentinel.db') as db:
+        db.row_factory = aiosqlite.Row
+        
+        cursor = await db.execute(
+            '''SELECT user_id, department, COUNT(*) as overlap_count
+               FROM shifts 
+               WHERE guild_id = ? AND end_time IS NULL
+               GROUP BY user_id, department
+               HAVING COUNT(*) > 1''',
+            (guild_id,)
+        )
+        
+        rows = await cursor.fetchall()
+        
+        overlaps = []
+        for row in rows:
+            # Get the overlapping user IDs
+            user_cursor = await db.execute(
+                '''SELECT user_id FROM shifts 
+                   WHERE guild_id = ? AND department = ? AND end_time IS NULL''',
+                (guild_id, row['department'])
+            )
+            users = [r[0] for r in await user_cursor.fetchall()]
+            
+            overlaps.append({
+                'department': row['department'],
+                'users': users,
+                'count': row['overlap_count']
+            })
+        
+        return overlaps
+
+async def detect_shift_violations(guild_id: int, hours: int = 24) -> List[Dict[str, Any]]:
+    """Detect shift violations (abnormally long shifts, etc.)"""
+    async with aiosqlite.connect('sentinel.db') as db:
+        db.row_factory = aiosqlite.Row
+        
+        cutoff = datetime.now() - timedelta(hours=hours)
+        
+        # Find shifts longer than 12 hours
+        cursor = await db.execute(
+            '''SELECT user_id, start_time, end_time, duration_seconds
+               FROM shifts 
+               WHERE guild_id = ? AND start_time > ? 
+               AND duration_seconds > ?''',
+            (guild_id, cutoff.isoformat(), 12 * 3600)
+        )
+        
+        rows = await cursor.fetchall()
+        
+        violations = []
+        for row in rows:
+            violations.append({
+                'user_id': row['user_id'],
+                'type': 'shift_too_long',
+                'duration': row['duration_seconds'],
+                'timestamp': row['start_time']
+            })
+        
+        return violations
+
+async def generate_shift_report(guild_id: int, days: int = 7) -> Dict[str, Any]:
+    """Generate comprehensive shift report"""
+    async with aiosqlite.connect('sentinel.db') as db:
+        db.row_factory = aiosqlite.Row
+        
+        cutoff = datetime.now() - timedelta(days=days)
+        
+        # Total shifts
+        cursor = await db.execute(
+            '''SELECT COUNT(*) as total FROM shifts 
+               WHERE guild_id = ? AND start_time > ?''',
+            (guild_id, cutoff.isoformat())
+        )
+        total_shifts = (await cursor.fetchone())['total']
+        
+        # Total hours
+        cursor = await db.execute(
+            '''SELECT SUM(duration_seconds) as total_seconds FROM shifts 
+               WHERE guild_id = ? AND start_time > ? AND duration_seconds IS NOT NULL''',
+            (guild_id, cutoff.isoformat())
+        )
+        total_seconds = (await cursor.fetchone())['total_seconds'] or 0
+        total_hours = total_seconds / 3600
+        
+        # Average duration
+        avg_duration = total_hours / total_shifts if total_shifts > 0 else 0
+        
+        # Top user
+        cursor = await db.execute(
+            '''SELECT user_id, COUNT(*) as shift_count 
+               FROM shifts 
+               WHERE guild_id = ? AND start_time > ?
+               GROUP BY user_id
+               ORDER BY shift_count DESC
+               LIMIT 1''',
+            (guild_id, cutoff.isoformat())
+        )
+        top_user_row = await cursor.fetchone()
+        top_user = f"User {top_user_row['user_id']}" if top_user_row else "N/A"
+        
+        # Top department
+        cursor = await db.execute(
+            '''SELECT department, COUNT(*) as shift_count 
+               FROM shifts 
+               WHERE guild_id = ? AND start_time > ? AND department IS NOT NULL
+               GROUP BY department
+               ORDER BY shift_count DESC
+               LIMIT 1''',
+            (guild_id, cutoff.isoformat())
+        )
+        top_dept_row = await cursor.fetchone()
+        top_dept = top_dept_row['department'] if top_dept_row else "N/A"
+        
+        return {
+            'total_shifts': total_shifts,
+            'total_hours': round(total_hours, 1),
+            'avg_duration': round(avg_duration, 1),
+            'top_user': top_user,
+            'top_dept': top_dept
+        }
+
+async def get_department_shifts(guild_id: int, department: str) -> List[Dict[str, Any]]:
+    """Get all shifts for a department"""
+    async with aiosqlite.connect('sentinel.db') as db:
+        db.row_factory = aiosqlite.Row
+        
+        cursor = await db.execute(
+            '''SELECT * FROM shifts 
+               WHERE guild_id = ? AND department = ?
+               ORDER BY start_time DESC
+               LIMIT 100''',
+            (guild_id, department)
+        )
+        
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def delete_old_logs(cutoff: datetime) -> int:
+    """Delete logs older than cutoff date"""
+    async with aiosqlite.connect('sentinel.db') as db:
+        cursor = await db.execute(
+            '''DELETE FROM logs WHERE timestamp < ?''',
+            (cutoff.isoformat(),)
+        )
+        await db.commit()
+        return cursor.rowcount
+
+async def set_server_config(guild_id: int, **kwargs) -> None:
+    """Set multiple server config fields at once"""
+    async with aiosqlite.connect('sentinel.db') as db:
+        # First ensure server exists
+        await db.execute(
+            '''INSERT OR IGNORE INTO servers (guild_id) VALUES (?)''',
+            (guild_id,)
+        )
+        
+        # Update each field
+        for key, value in kwargs.items():
+            await db.execute(
+                f'''UPDATE servers SET {key} = ? WHERE guild_id = ?''',
+                (value, guild_id)
+            )
+        
+        await db.commit()
+
+# ============= ENHANCED INIT DATABASE =============
+
+async def init_database():
+    """Initialize all database tables including new features"""
+    async with aiosqlite.connect('sentinel.db') as db:
+        # Existing tables...
+        
+        # Warnings table
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS warnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                warner_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                active BOOLEAN DEFAULT 1
+            )
+        ''')
+        
+        # Add new columns to servers table if they don't exist
+        try:
+            await db.execute('''
+                ALTER TABLE servers ADD COLUMN message_log_channel_id INTEGER
+            ''')
+        except:
+            pass
+        
+        try:
+            await db.execute('''
+                ALTER TABLE servers ADD COLUMN voice_log_channel_id INTEGER
+            ''')
+        except:
+            pass
+        
+        try:
+            await db.execute('''
+                ALTER TABLE servers ADD COLUMN daily_reports_enabled BOOLEAN DEFAULT 0
+            ''')
+        except:
+            pass
+        
+        await db.commit()
+        print("✅ Database initialized with new features")
