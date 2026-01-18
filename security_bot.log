@@ -28,3 +28,48 @@
 2026-01-08 14:08:19,110 - SecurityBot - INFO - Cleaned up old logs
 2026-01-08 14:08:19,786 - SecurityBot - INFO - ✅ Synced 63 commands
 2026-01-08 14:08:19,786 - SecurityBot - INFO - 🔍 Monitoring...
+2026-01-17 21:08:50,718 - discord.client - WARNING - PyNaCl is not installed, voice will NOT be supported
+2026-01-17 21:08:50,723 - SecurityBot - INFO - 🚀 STARTING SENTINEL SECURITY BOT v2.0 - COMPLETE
+2026-01-17 21:08:50,726 - discord.client - INFO - logging in using static token
+2026-01-17 21:08:51,696 - discord.gateway - INFO - Shard ID None has connected to Gateway (Session ID: 813f385281ea32031ddbe4fd42ad5396).
+2026-01-17 21:08:53,731 - SecurityBot - INFO - Sentinel#6872 connected!
+2026-01-17 21:08:53,731 - SecurityBot - INFO - In 2 servers
+2026-01-17 21:08:53,750 - SecurityBot.Database - INFO - ✅ Database initialized successfully
+2026-01-17 21:08:53,751 - SecurityBot - INFO - ✅ DB initialized
+2026-01-17 21:08:53,755 - SecurityBot - INFO - ✅ Loaded configs
+2026-01-17 21:08:53,755 - SecurityBot - INFO - ✅ Added persistent views
+2026-01-17 21:08:53,755 - SecurityBot - INFO - ✅ Background tasks started
+2026-01-17 21:08:53,756 - SecurityBot - INFO - 📊 Daily violation report task ready (runs daily at 6 AM UTC)
+2026-01-17 21:08:53,759 - SecurityBot - INFO - Cleaned up old logs
+2026-01-17 21:08:54,146 - SecurityBot - INFO - ✅ Synced 70 commands
+2026-01-17 21:08:54,146 - SecurityBot - INFO - 🔍 Monitoring...
+2026-01-17 21:09:46,031 - discord.client - WARNING - PyNaCl is not installed, voice will NOT be supported
+2026-01-17 21:09:46,037 - SecurityBot - INFO - 🚀 STARTING SENTINEL SECURITY BOT v2.0 - COMPLETE
+2026-01-17 21:09:46,038 - discord.client - INFO - logging in using static token
+2026-01-17 21:09:46,738 - discord.gateway - INFO - Shard ID None has connected to Gateway (Session ID: cf93d760e17b13e99b771f71f13c5ecb).
+2026-01-17 21:09:48,806 - SecurityBot - INFO - Sentinel#6872 connected!
+2026-01-17 21:09:48,806 - SecurityBot - INFO - In 2 servers
+2026-01-17 21:09:48,810 - SecurityBot.Database - INFO - ✅ Database initialized successfully
+2026-01-17 21:09:48,811 - SecurityBot - INFO - ✅ DB initialized
+2026-01-17 21:09:48,814 - SecurityBot - INFO - ✅ Loaded configs
+2026-01-17 21:09:48,815 - SecurityBot - INFO - ✅ Added persistent views
+2026-01-17 21:09:48,815 - SecurityBot - INFO - ✅ Background tasks started
+2026-01-17 21:09:48,816 - SecurityBot - INFO - 📊 Daily violation report task ready (runs daily at 6 AM UTC)
+2026-01-17 21:09:48,818 - SecurityBot - INFO - Cleaned up old logs
+2026-01-17 21:09:49,097 - SecurityBot - INFO - ✅ Synced 70 commands
+2026-01-17 21:09:49,097 - SecurityBot - INFO - 🔍 Monitoring...
+2026-01-17 21:10:49,037 - discord.client - WARNING - PyNaCl is not installed, voice will NOT be supported
+2026-01-17 21:10:49,043 - SecurityBot - INFO - 🚀 STARTING SENTINEL SECURITY BOT v2.0 - COMPLETE
+2026-01-17 21:10:49,044 - discord.client - INFO - logging in using static token
+2026-01-17 21:10:49,867 - discord.gateway - INFO - Shard ID None has connected to Gateway (Session ID: 970d402965bd56e5ac79e617f5119686).
+2026-01-17 21:10:51,889 - SecurityBot - INFO - Sentinel#6872 connected!
+2026-01-17 21:10:51,889 - SecurityBot - INFO - In 2 servers
+2026-01-17 21:10:51,893 - SecurityBot.Database - INFO - ✅ Database initialized successfully
+2026-01-17 21:10:51,893 - SecurityBot - INFO - ✅ DB initialized
+2026-01-17 21:10:51,896 - SecurityBot - INFO - ✅ Loaded configs
+2026-01-17 21:10:51,897 - SecurityBot - INFO - ✅ Added persistent views
+2026-01-17 21:10:51,897 - SecurityBot - INFO - ✅ Background tasks started
+2026-01-17 21:10:51,898 - SecurityBot - INFO - 📊 Daily violation report task ready (runs daily at 6 AM UTC)
+2026-01-17 21:10:51,900 - SecurityBot - INFO - Cleaned up old logs
+2026-01-17 21:10:52,275 - SecurityBot - INFO - ✅ Synced 70 commands
+2026-01-17 21:10:52,275 - SecurityBot - INFO - 🔍 Monitoring...
