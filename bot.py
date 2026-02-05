@@ -5084,15 +5084,16 @@ async def role_heal(interaction: discord.Interaction):
 
 # ============= TASK STARTUP =============
 
-@shift_heartbeat.before_loop
-@cleanup_old_logs.before_loop
-@reset_daily_threat.before_loop
-@daily_violation_report.before_loop
-@security_scan_task.before_loop
 async def before_loops():
-    """Wait for bot to be ready before starting tasks"""
     await bot.wait_until_ready()
     logger.info("✅ Bot ready - starting background tasks")
+
+shift_heartbeat.before_loop(before_loops)
+cleanup_old_logs.before_loop(before_loops)
+reset_daily_threat.before_loop(before_loops)
+daily_violation_report.before_loop(before_loops)
+security_scan_task.before_loop(before_loops)
+
 
 # ============= BOT EXECUTION =============
 
