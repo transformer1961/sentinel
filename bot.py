@@ -2633,6 +2633,10 @@ async def on_ready():
     """
     try:
         logger.info("=" * 70)
+        logger.info("🛡️ SENTINEL SECURITY BOT v2.2")
+        logger.info("Created by: transformer1961")  # <-- CHANGE THIS
+        logger.info("GitHub: https://github.com/transformer1961/sentinel")  # <-- CHANGE THIS
+        logger.info("=" * 70)
         logger.info(f"✅ Logged in as {bot.user.name} (ID: {bot.user.id})")
         logger.info(f"📊 Connected to {len(bot.guilds)} guild(s)")
         logger.info(f"👥 Serving {sum(g.member_count for g in bot.guilds)} total users")
